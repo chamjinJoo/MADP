@@ -1,0 +1,33 @@
+# configs.yaml
+seed: 42
+
+params:
+  cuda: True
+  batch_size: 32
+  batch_length: 8
+  learning_rate: 0.0001
+  epoch: 400
+
+logger:
+  logger: tensorboard 
+  logdir: C:\Users\Chamjin Joo\Desktop\cham\Etri_project\MADP\logs
+
+dectiger:
+  task: dectiger
+  run: {steps: 2, train_ratio: 64}
+  maxtimestep: 2
+  obs_dim: 64
+  hidden_dim: 64
+  z_dim: 32
+  gat_dim: 32
+  act_dim: 3
+  nagents: 2
+
+rware:
+  task: rware
+  nagents: 2
+  hidden_dim: 64
+  z_dim: 32
+  gat_dim: 32
+  act_dim: 5
+  
