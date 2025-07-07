@@ -25,7 +25,7 @@ model:
   use_gat: True
   use_causal_gat: True
   use_rnn: True
-  hidden_dim: 32
+  hidden_dim: 48
   z_dim: 16
   gat_dim: 16
   act_dim: 3
@@ -42,7 +42,7 @@ training:
   kl_coef: 0.1  # KL 계수
   coop_coef: 0.1  # 협력 계수
   ema_alpha: 0.99  # EMA 알파
-  total_steps: 20000  # 총 학습 스텝
+  total_steps: 3000  # 총 학습 스텝
   ep_num: 5  # 에피소드 수
 
 dectiger:
@@ -64,6 +64,11 @@ rware:
 mpe:
   task: mpe_simple_spread
   nagents: 3
+
+speaker_listener:
+  task: speaker_listener
+  max_cycles: 25
+  continuous_actions: False
 
 smax:
   task: smax # 2s3z

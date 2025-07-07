@@ -14,7 +14,7 @@ from src.env_wrapper import (DecTigerWrapper,
                              SwitchWrapper,
                              PPWrapper,
                              LBForagingWrapper,
-                             MultiAgentBlicketWrapper)
+                            )
 
 import yaml, argparse
 import torch

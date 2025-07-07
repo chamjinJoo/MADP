@@ -11,6 +11,33 @@ GPU 사용을 위한 전반적인 최적화가 적용된 멀티에이전트 강�
 - **Mixed Precision**: 메모리 사용량 절약 및 훈련 속도 향상
 - **실험 관리**: 하이퍼파라미터 및 설정 자동 저장, 결과 추적
 
+## 📋 모델 개요 및 아키텍처
+
+### 핵심 아이디어
+- **VRNN (Variational RNN)**: 각 에이전트의 시퀀스 정보를 latent space에서 모델링
+- **Multi-Head CausalGATLayer**: 4개의 독립적인 attention head로 다양한 추론 능력 구현
+- **JSD-based Neighbor Selection**: Jensen-Shannon Divergence를 이용한 동적 neighbor 선택
+- **Adaptive Loss Balancing**: VAE, RL, Communication loss의 동적 균형 조정
+
+### 주요 특징
+- **Dec-POMDP 호환**: 각 에이전트는 자신의 관찰만 접근 가능
+- **Multi-Head Attention**: 4개의 독립적인 attention head로 다양한 추론
+- **End-to-end 학습**: VAE, RL, Communication loss를 동시에 최적화
+- **Rolling Error Attention**: 예측 오차의 이동평균을 GAT attention에 반영
+- **Layer Normalization**: 학습 안정성 향상
+- **Ablation 지원**: GAT, CausalGAT, Head별 비활성화 옵션
+
+### VRNN + GAT + Actor-Critic
+
+1. **VRNN (Variational RNN)**: 각 에이전트의 개인 상태 인코딩
+2. **GAT (Graph Attention Network)**: 에이전트 간 상호작용 모델링
+3. **Causal GAT**: 인과적 추론을 위한 다중 헤드 어텐션
+4. **Actor-Critic**: 정책 및 가치 함수 학습
+
+### Multi-Head Causal VRNN-GAT Model 구조
+
+(아키텍처 다이어그램 및 데이터 플로우, 각 Head의 역할, Ablation 옵션 등은 기존 상세 설명을 유지)
+
 ## 🛠️ 설치
 
 ### 요구사항
@@ -111,21 +138,10 @@ GPU 메모리: 24.0 GB
 Mixed Precision: True
 ```
 
-## 🏗️ 아키텍처
+## 🏗️ 아키텍처 상세 (요약)
 
-### VRNN + GAT + Actor-Critic
-
-1. **VRNN (Variational RNN)**: 각 에이전트의 개인 상태 인코딩
-2. **GAT (Graph Attention Network)**: 에이전트 간 상호작용 모델링
-3. **Causal GAT**: 인과적 추론을 위한 다중 헤드 어텐션
-4. **Actor-Critic**: 정책 및 가치 함수 학습
-
-### GPU 최적화 기능
-
-- **Mixed Precision**: FP16 연산으로 메모리 사용량 절약
-- **Memory Pinning**: CPU-GPU 간 데이터 전송 최적화
-- **Gradient Accumulation**: 대용량 배치 처리
-- **Automatic Memory Management**: 메모리 캐시 자동 정리
+- VRNNCell, Multi-Head CausalGATLayer, Policy Heads로 구성
+- 각 Head별 역할, 데이터 플로우, Loss Function, Ablation 옵션 등은 기존 설명 참고
 
 ## 📊 성능 최적화
 

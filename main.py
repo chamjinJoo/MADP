@@ -13,8 +13,7 @@ from src.env_wrapper import (DecTigerWrapper,
                              MPEGymWrapper, 
                              SwitchWrapper,
                              PPWrapper,
-                             LBForagingWrapper,
-                             MultiAgentBlicketWrapper)
+                             LBForagingWrapper,)
 
 import yaml, argparse
 import torch
@@ -38,7 +37,7 @@ def set_seed(seed: int):
 def create_env(env_name: str, env_cfg: dict, seed: int, device: torch.device | None = None):
     """GPU 최적화된 환경 생성 함수"""
     if env_name == 'dectiger':
-        env = DecTigerWrapper(proj_dim=16, seed=seed, device=device)
+        env = DecTigerWrapper(proj_dim=16, seed=seed, )
         obs_dim = env.obs_dim
         act_dim = env.act_dim
         nagents = env.n
@@ -47,13 +46,13 @@ def create_env(env_name: str, env_cfg: dict, seed: int, device: torch.device | N
         layout = env_cfg.get("layout", None)
         env_name_str = f"rware:rware-tiny-{env_cfg['nagents']}ag-v2"
         base_env = gym.make(env_name_str, layout=layout)
-        env = RWAREWrapper(base_env, device=device)
+        env = RWAREWrapper(base_env, )
         obs_dim = env.obs_dim
         act_dim = env.act_dim
         nagents = env.n
         
     elif env_name == 'smax':
-        env = SMAXGymWrapper(map_name="2s3z", seed=seed, device=device)
+        env = SMAXGymWrapper(map_name="2s3z", seed=seed, )
         obs_dim = env.obs_dim
         act_dim = env.act_dim
         nagents = env.n
@@ -65,7 +64,18 @@ def create_env(env_name: str, env_cfg: dict, seed: int, device: torch.device | N
             max_cycles=env_cfg.get("max_cycles", 25),
             continuous_actions=env_cfg.get("continuous_actions", False),
             seed=seed,
-            device=device
+            
+            )
+        obs_dim = env.obs_dim
+        act_dim = env.act_dim
+        nagents = env.n
+
+    elif env_name == 'speaker_listener': # simple-speaker-listener
+        env = SpeakerListenerWrapper(
+            max_cycles=env_cfg.get("max_cycles", 25),
+            continuous_actions=env_cfg.get("continuous_actions", False),
+            seed=seed,
+            
             )
         obs_dim = env.obs_dim
         act_dim = env.act_dim
@@ -76,7 +86,7 @@ def create_env(env_name: str, env_cfg: dict, seed: int, device: torch.device | N
             step_cost = -0.1,
             n_agents = 2,
             max_steps = 50,
-            device=device
+            
             )
         obs_dim = env.obs_dim
         act_dim = env.act_dim
@@ -87,7 +97,7 @@ def create_env(env_name: str, env_cfg: dict, seed: int, device: torch.device | N
                         n_preys=1, 
                         max_steps=100, 
                         agent_view_mask=(5, 5),
-                        device=device
+                        
         )
         obs_dim = env.obs_dim
         act_dim = env.act_dim
@@ -100,7 +110,7 @@ def create_env(env_name: str, env_cfg: dict, seed: int, device: torch.device | N
                                 force_coop=True, 
                                 sight=2,
                                 seed=seed,
-                                device=device
+                                
         )
         obs_dim = env.obs_dim
         act_dim = env.act_dim
@@ -110,13 +120,13 @@ def create_env(env_name: str, env_cfg: dict, seed: int, device: torch.device | N
         env = MultiAgentBlicketWrapper(n_agents=3,
                                        n_blickets=3,
                                        max_steps=20,
-                                       device=device
+                                       
         )
         obs_dim = env.obs_dim
         act_dim = env.act_dim
         nagents = env.n 
     else:
-        raise ValueError(f"Unknown environment: {env_name}. Available envs are (dectiger, rware, smax, mpe, switch, pp, foraging, blicket)")
+        raise ValueError(f"Unknown environment: {env_name}. Available envs are (dectiger, rware, smax, mpe, speaker_listener, switch, pp, foraging, blicket)")
 
     return env, obs_dim, act_dim, nagents
 
