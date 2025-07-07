@@ -31,6 +31,80 @@ __all__ = [
     "TrainConfig",     # dataclass imported below
 ]
 
+# === LB-Foraging 환경 래퍼 ===
+try:
+    import lbforaging
+    LBF_AVAILABLE = True
+except ImportError:
+    LBF_AVAILABLE = False
+    print("Warning: lbforaging not available. Install with: pip install lbforaging")
+
+class LBForagingWrapper:
+    """Wrapper for Level-Based Foraging (lbforaging) environment."""
+    def __init__(self, grid_size=8, n_agents=2, n_food=3, force_coop=True, sight=2, seed=0):
+        if not LBF_AVAILABLE:
+            raise ImportError("lbforaging is required. Install with: pip install lbforaging")
+        import gymnasium as gym
+        from gymnasium.envs.registration import register
+        env_id = f"Foraging-{grid_size}x{grid_size}-{n_agents}p-{n_food}f"
+        if force_coop:
+            env_id += "-coop"
+        env_id += "-v3"
+        if env_id not in gym.envs.registry:
+            register(
+                id=env_id,
+                entry_point="lbforaging.foraging:ForagingEnv",
+                kwargs={
+                    "players": n_agents,
+                    # "min_player_level": 1,
+                    # "max_player_level": 1,
+                    # "min_food_level": 3,
+                    # "max_food_level": 4,
+                    "field_size": (grid_size, grid_size),
+                    "max_num_food": n_food,
+                    "sight": sight,
+                    "max_episode_steps": 50,
+                    "force_coop": force_coop,
+                },
+            )
+        self.env = gym.make(env_id)
+        self.env.reset(seed=seed)
+        self.name = "lbforaging"
+        self.n = n_agents
+        obs, _ = self.env.reset()
+        self.obs_dim = len(obs[0])
+        if hasattr(self.env.action_space, '__getitem__'):
+            self.act_dim = self.env.action_space[0].n
+        else:
+            self.act_dim = self.env.action_space.n
+
+    def reset(self, seed: int | None = None):
+        if seed is not None:
+            self.env.reset(seed=seed)
+        obs, _ = self.env.reset()
+        return np.stack(obs, axis=0)  # (N, obs_dim)
+
+    def step(self, acts):
+        if isinstance(acts, np.ndarray):
+            acts = acts.tolist()
+        obs, reward, done, truncated, info = self.env.step(acts)
+        obs = np.stack(obs, axis=0)
+        reward = np.array(reward, dtype=np.float32) if isinstance(reward, (list, tuple, np.ndarray)) else np.array([reward]*self.n, dtype=np.float32)
+        foods_left = info.get('food', None)
+        if foods_left is not None:
+            success = (foods_left == 0)
+        else:
+            success = (np.sum(reward) > 0)
+        info = info or {}
+        info['success'] = bool(success)
+        return obs, reward, done, truncated, info
+
+    def render(self, mode): # mode: dummy
+        return self.env.render()
+
+    def close(self):
+        self.env.close()
+
 class RWAREWrapper:
     """Lightweight wrapper adapting RWARE to (N, obs_dim) numpy API."""
 

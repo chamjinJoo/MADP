@@ -2,9 +2,9 @@ import os
 # OpenMP 라이브러리 충돌 방지
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
-from src.train import Trainer, get_device
-from src.models import VRNNGATA2C
-from src.utils import save_all_results
+from src.train_att import TrainerAtt, get_device
+from src.models_att import VRNNDecentralizedA2C
+
 from pathlib import Path
 from src.envs import DecTigerEnv
 from src.env_wrapper import (DecTigerWrapper, 
@@ -37,6 +37,10 @@ def set_seed(seed: int):
 
 def create_env(env_name: str, env_cfg: dict, seed: int, device: torch.device | None = None):
     """GPU 최적화된 환경 생성 함수"""
+    # device가 None인 경우 기본값 설정
+    if device is None:
+        device = torch.device("cpu")
+    
     if env_name == 'dectiger':
         env = DecTigerWrapper(proj_dim=16, seed=seed, device=device)
         obs_dim = env.obs_dim
@@ -122,7 +126,7 @@ def create_env(env_name: str, env_cfg: dict, seed: int, device: torch.device | N
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default=r"configs.yaml")
+    parser.add_argument("--config", type=str, default=r"configs_att.yaml")
     parser.add_argument("--env",    type=str, default="dectiger")
     args = parser.parse_args()
 
@@ -142,19 +146,19 @@ def main():
     # 환경 생성
     env, obs_dim, act_dim, nagents = create_env(env_name, env_cfg, SEED, device)
 
-    # 모델 생성
+    # 모델 생성 (VRNNDecentralizedA2C 사용)
     model_cfg = cfg['model']
-    model = VRNNGATA2C(
+    model = VRNNDecentralizedA2C(
         obs_dim=obs_dim,
         act_dim=act_dim,
         hidden_dim=model_cfg['hidden_dim'],
         z_dim=model_cfg['z_dim'],
-        gat_dim=model_cfg['gat_dim'],
+        d_model=model_cfg.get('d_model', model_cfg.get('gat_dim', 64)),  # d_model 사용, 없으면 gat_dim 사용
         n_agents=nagents,
-        use_gat=model_cfg['use_gat'],
-        use_causal_gat=model_cfg['use_causal_gat'],
+        use_attention=model_cfg.get('use_attention', model_cfg.get('use_gat', True)),  # use_attention 사용
         use_rnn=model_cfg['use_rnn']
     )
+    
     # 훈련 설정
     from dataclasses import dataclass
     @dataclass
@@ -172,8 +176,7 @@ def main():
         nll_coef: float
         value_coef: float
         mixed_precision: bool
-        ema_alpha: float
-        use_causal_gat: bool
+        infer_coef: float  # inference loss coefficient
         
         def __post_init__(self):
             pass
@@ -193,8 +196,7 @@ def main():
         nll_coef=float(cfg['training']['nll_coef']),
         value_coef=float(cfg['training']['value_coef']),
         mixed_precision=cfg['params'].get('mixed_precision', False),
-        ema_alpha=float(cfg['training'].get('ema_alpha', 0.99)),
-        use_causal_gat=cfg.get('use_causal_gat', False)
+        infer_coef=float(cfg['training'].get('infer_coef', 0.1))  # inference coefficient
     )
     
     # 실험 설정을 딕셔너리로 변환
@@ -216,8 +218,7 @@ def main():
             'nll_coef': train_config.nll_coef,
             'value_coef': train_config.value_coef,
             'mixed_precision': train_config.mixed_precision,
-            'ema_alpha': train_config.ema_alpha,
-            'use_causal_gat': train_config.use_causal_gat
+            'infer_coef': train_config.infer_coef
         },
         'params': cfg['params'],
         'seed': SEED,
@@ -230,16 +231,15 @@ def main():
         'act_dim': act_dim,
         'n_agents': nagents,
         'hidden_dim': model_cfg['hidden_dim'],
-        'gat_dim': model_cfg['gat_dim'],
+        'd_model': model_cfg.get('d_model', model_cfg.get('gat_dim', 64)),
         'z_dim': model_cfg['z_dim'],
-        'use_gat': model_cfg['use_gat'],
-        'use_causal_gat': model_cfg['use_causal_gat'],
+        'use_attention': model_cfg.get('use_attention', model_cfg.get('use_gat', True)),
         'use_rnn': model_cfg['use_rnn']
     })
     
-    trainer = Trainer(env, model, train_config, device=str(device), 
-                     experiment_config=experiment_config)
+    trainer = TrainerAtt(env, model, train_config, device=str(device), 
+                        experiment_config=experiment_config)
     trainer.train()
 
 if __name__ == "__main__":
-    main()
+    main() 

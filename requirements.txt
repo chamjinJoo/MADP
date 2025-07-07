@@ -1,3 +1,38 @@
+# GPU 최적화를 위한 핵심 패키지들
+torch>=2.0.0
+torchvision>=0.15.0
+torchaudio>=2.0.0
+numpy>=1.21.0
+matplotlib>=3.5.0
+pillow>=9.0.0
+tqdm>=4.64.0
+pyyaml>=6.0.0
+gymnasium>=0.28.0
+gym>=0.26.0
+
+# JAX 관련 (GPU 지원)
+jax>=0.4.0
+jaxlib>=0.4.0
+jaxmarl>=0.1.0
+flax>=0.6.0
+optax>=0.1.0
+
+# 멀티에이전트 환경
+lbforaging>=1.0.0
+pettingzoo>=1.22.0
+
+# 기타 유틸리티
+tensorboard>=2.10.0
+wandb>=0.13.0
+seaborn>=0.11.0
+scipy>=1.9.0
+scikit-learn>=1.1.0
+
+# 개발 도구
+black>=22.0.0
+flake8>=5.0.0
+isort>=5.10.0
+
 absl-py==2.3.0
 aiobotocore @ file:///C:/b/abs_a0zxrsvpwx/croot/aiobotocore_1714464454692/work
 aiohappyeyeballs @ file:///C:/b/abs_b505trsapr/croot/aiohappyeyeballs_1725434036096/work

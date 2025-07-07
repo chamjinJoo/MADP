@@ -2,20 +2,24 @@ import random
 import numpy as np
 import gym
 from gym import spaces
+from typing import Dict, Any, List, Tuple, Set
+import itertools
+
 
 class DecTigerEnv(gym.Env):
     """
     Gym environment for Dec-Tiger with per-agent Gaussian random feature projection.
     Each agent receives its own high-dimensional continuous observation.
+    Extended to 20 steps with time pressure and information degradation.
     """
     metadata = {'render.modes': ['human']}
     
-    def __init__(self, proj_dim=16, seed=0):
+    def __init__(self, proj_dim=32, seed=0, max_steps=2):
         super().__init__()
         # Actions: 0:listen, 1:open-left, 2:open-right
         self._actions = ["listen", "open-left", "open-right"]
         self.action_space = spaces.MultiDiscrete([3, 3])
-        self.maxtimestep = 2
+        self.maxtimestep = max_steps
         self.nagents = 2
         # Base discrete obs for each agent: hear-left(0), hear-right(1)
         # but we won't use base_obs_space directly in projection wrapper
@@ -32,6 +36,13 @@ class DecTigerEnv(gym.Env):
         self.observation_space = spaces.Tuple((obs_box, obs_box))
         
         self.states = ["tiger-left", "tiger-right"]
+        
+        # 시간 압박 관련 설정
+        self._base_listen_penalty = -0.2
+        self._time_pressure_factor = 0.1  # 시간당 추가 페널티
+        self._information_decay_rate = 0.05  # 정보 노이즈 증가율
+        self._opportunity_cost_factor = 0.05  # 기회 비용
+        
         self.reset()
 
     def seed(self, seed: int):
@@ -47,8 +58,9 @@ class DecTigerEnv(gym.Env):
         o0 = 1 if self.py_random.random() < p else 0
         o1 = 1 if self.py_random.random() < p else 0
         base_obs = (o0, o1)
+        
         # Return projected observations for both agents
-        return self._project_obs(base_obs) + np.random.normal(0, 1, size=self.proj_dim)
+        return self._project_obs(base_obs)
     
     def step(self, action):
         """
@@ -59,23 +71,34 @@ class DecTigerEnv(gym.Env):
         a0, a1 = int(action[0]), int(action[1])
         ja = (self._actions[a0], self._actions[a1])
         
-        # Compute reward
+        # 시간 압박을 고려한 보상 계산
+        time_pressure = self.time * self._time_pressure_factor
+        opportunity_cost = self.time * self._opportunity_cost_factor
+        
+        # Compute reward with time pressure
         if ja == ("listen", "listen"):
-            reward = -0.2
+            # 시간이 지날수록 listen 페널티 증가
+            base_penalty = self._base_listen_penalty
+            time_penalty = time_pressure
+            reward = base_penalty - time_penalty
         else:
             done = True
             if ja == ("open-left", "open-left"):
-                reward = -10 if self.state=="tiger-left" else +2.0
+                base_reward = -10 if self.state=="tiger-left" else +2.0
+                reward = base_reward - opportunity_cost
             elif ja == ("open-right", "open-right"):
-                reward = -10 if self.state=="tiger-right" else +2.0
+                base_reward = -10 if self.state=="tiger-right" else +2.0
+                reward = base_reward - opportunity_cost
             elif ja in [("open-left","open-right"), ("open-right","open-left")]:
-                reward = -10.1
+                reward = -10.1 - opportunity_cost
             else:
                 opener = ja[1] if ja[0]=="listen" else ja[0]
                 if opener == "open-left":
-                    reward = -10 if self.state=="tiger-left" else +0.3
+                    base_reward = -10 if self.state=="tiger-left" else +0.3
                 else:
-                    reward = -10 if self.state=="tiger-right" else +0.3
+                    base_reward = -10 if self.state=="tiger-right" else +0.3
+                reward = base_reward - opportunity_cost
+        
         # Generate base discrete obs per agent
         if ja == ("listen", "listen"):
             p = 0.85 if self.state=="tiger-left" else 0.15
@@ -86,15 +109,23 @@ class DecTigerEnv(gym.Env):
             o0 = 1 if self.py_random.random() < p else 0
             o1 = 1 if self.py_random.random() < p else 0
         
-        # Project observations separately
+        # Project observations with increasing noise over time
         obs0, obs1 = self._project_obs((o0, o1))
-        info = {'state': self.state, 
-                'action': ja,
-                'obs0': 'hear-right' if o0 else 'hear-left', 
-                'obs1': 'hear-right' if o1 else 'hear-left',}
+        
+        info = {
+            'state': self.state, 
+            'action': ja,
+            'obs0': 'hear-right' if o0 else 'hear-left', 
+            'obs1': 'hear-right' if o1 else 'hear-left',
+            'time': self.time,
+            'time_pressure': time_pressure,
+            'opportunity_cost': opportunity_cost,
+        }
+        
         self.time += 1
         if self.time == self.maxtimestep:
-            done=True
+            done = True
+        
         return (obs0, obs1), reward, done, info
     
     def _project_obs(self, base_obs):
@@ -108,25 +139,23 @@ class DecTigerEnv(gym.Env):
         x0 = np.ones(self.proj_dim, dtype=np.float32) * o0
         x1 = np.ones(self.proj_dim, dtype=np.float32) * o1
 
-        noise0 = self.np_random.normal(0.0, 0.1, size=self.proj_dim).astype(np.float32)
-        noise1 = self.np_random.normal(0.0, 0.1, size=self.proj_dim).astype(np.float32)
+        # 시간이 지날수록 노이즈 증가 (정보 품질 저하)
+        base_noise_std = 0.1
+        time_noise_std = self.time * self._information_decay_rate
+        total_noise_std = base_noise_std + time_noise_std
         
-        o0_porj = x0 + noise0
-        o1_porj = x1 + noise1
+        noise0 = self.py_random.gauss(0.0, total_noise_std)
+        noise1 = self.py_random.gauss(0.0, total_noise_std)
+        
+        # 노이즈를 전체 벡터에 적용
+        noise0_vec = np.full(self.proj_dim, noise0, dtype=np.float32)
+        noise1_vec = np.full(self.proj_dim, noise1, dtype=np.float32)
+        
+        o0_proj = x0 + noise0_vec
+        o1_proj = x1 + noise1_vec
 
-        return o0_porj, o1_porj
+        return o0_proj, o1_proj
     
     def render(self, mode='human'):
         print(f"Hidden tiger state: {self.state}")
-        
-# Example usage
-if __name__ == "__main__":
-    env = DecTigerEnv(proj_dim=64, seed=123)
-    (obs0, obs1) = env.reset()
-    for _ in range(3):
-        action = env.action_space.sample()
-        print(env.state)
-        print("obs0[:3]:", obs0[:3], "obs1[:3]:", obs1[:3])
-        (obs0, obs1), reward, done, info = env.step(action)
-        print(info['action'], "reward:", reward)
-        print(info['obs0'],info['obs1'])
+        print(f"Current time step: {self.time}/{self.maxtimestep}")
