@@ -1,53 +1,74 @@
-"""
-train.py — Training script using Trainer and utils
-================================================
-* Pure algorithm: uses DecTigerEnv, VRNNGATA2C model
-* Delegates logging, progress bar, and plotting to utils.py
-
-Usage:
-    from src.train import Trainer, TrainConfig
-    from src.models import VRNNGATA2C
-    from src.envs import DecTigerEnv
-
-    env = DecTigerEnv(proj_dim=64)
-    model = VRNNGATA2C(obs_dim=64, act_dim=3, hidden_dim=128, z_dim=32, n_agents=2, gat_dim=256)
-    cfg = TrainConfig(total_steps=50000, batch_length=16, lr=3e-4)
-    trainer = Trainer(env, model, cfg)
-    trainer.train()
-"""
+# train.py — Training script using Trainer and utils (with VAE pretraining and full RL unpack)
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
 from typing import List, Tuple, Dict, Any, Callable
+from collections import deque
+import gc
+import time
+from contextlib import nullcontext
+from torch.amp.autocast_mode import autocast
+from torch.amp.grad_scaler import GradScaler
 
-from src.models import VRNNGATA2C, compute_rl_loss, compute_vae_loss, compute_rl_ppo_loss
+# Mixed precision 지원
+try:
+    from torch.amp.autocast_mode import autocast
+    MIXED_PRECISION_AVAILABLE = True
+except ImportError:
+    MIXED_PRECISION_AVAILABLE = False
+    print("Warning: Mixed precision not available. Install PyTorch >= 1.6.0")
+
+from src.env_wrapper import MPEGymWrapper, RWAREWrapper
+from src.models import (
+    VRNNGATA2C,
+    compute_rl_loss,
+    compute_vae_loss
+)
 from src.utils import (
-    create_progress_bar, init_history,
-    update_history, plot_history,
-    plot_phase_success,
-    plot_episode_returns
+    create_progress_bar,
+    init_history,
+    update_history,
+    plot_history,
+    plot_episode_returns,
+    save_all_results,
 )
 
 # ---------------------------------------------------------------------------
-# Helpers
+# GPU 최적화 헬퍼 함수들
 # ---------------------------------------------------------------------------
 
-def sample_actions(logits: torch.Tensor) -> torch.Tensor:
-    """Categorical sampling per agent."""
-    return torch.distributions.Categorical(logits=logits).sample()
+def get_device(cfg) -> torch.device:
+    """GPU 디바이스 설정 및 최적화"""
+    if cfg['params']['cuda'] and torch.cuda.is_available():
+        device = torch.device("cuda")
+        # GPU 메모리 최적화 설정
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
+        # GPU 메모리 캐시 정리
+        torch.cuda.empty_cache()
+        print(f"GPU 사용: {torch.cuda.get_device_name()}")
+        print(f"GPU 메모리: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+    else:
+        device = torch.device("cpu")
+        print("CPU 사용")
+    return device
 
+def optimize_memory():
+    """메모리 최적화"""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+def sample_actions(logits: torch.Tensor) -> torch.Tensor:
+    return torch.distributions.Categorical(logits=logits).sample()
 
 def compute_gae_multi(
     rews: np.ndarray, vals: np.ndarray,
     dones: np.ndarray, gamma: float=0.99,
     lam: float=0.95
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Compute GAE for shared scalar reward and per-agent value predictions.
-    rews: (T,N), vals: (T,N), dones: (T,)
-    returns adv, ret arrays of shape (T,N).
-    """
     T, N = vals.shape
     adv = np.zeros((T, N), dtype=np.float32)
     next_val = np.zeros(N, dtype=np.float32)
@@ -59,9 +80,122 @@ def compute_gae_multi(
         next_val, next_adv = vals[t], adv[t]
     return adv, adv + vals
 
+def unpack_trajectory(traj: list[tuple]) -> tuple[dict[str, list], dict[str, Any]]:
+    """trajectory 리스트에서 각 항목을 dict로 한 번에 추출, numpy 변환은 별도 반환"""
+    keys = ['obs', 'acts', 'rews', 'vals', 'dones']
+    data = {k: [] for k in keys}
+    for t in traj:
+        for i, k in enumerate(keys):
+            data[k].append(t[i])
+    # numpy 변환
+    np_data = {
+        'obs': data['obs'],
+        'acts': np.stack(data['acts'], axis=0),
+        'rews': np.array(data['rews'], dtype=np.float32),
+        'vals': np.stack(data['vals'], axis=0),
+        'dones': np.array(data['dones'], dtype=np.float32),
+    }
+    return data, np_data
+
+def to_torch(arr, device, flatten=False, dtype=None):
+    """GPU로 데이터 전송 최적화"""
+    if isinstance(arr, np.ndarray):
+        t = torch.from_numpy(arr)
+    else:
+        t = torch.tensor(arr)
+    
+    if dtype is not None:
+        t = t.type(dtype)
+    if flatten:
+        t = t.flatten()
+    
+    # GPU로 전송 시 pin_memory 사용
+    if device.type == 'cuda' and t.is_contiguous():
+        t = t.pin_memory().to(device, non_blocking=True)
+    else:
+        t = t.to(device)
+    
+    return t
+
+def get_onehot_actions(acts_np, act_dim, device):
+    acts = torch.from_numpy(acts_np).long().to(device)
+    return F.one_hot(acts, num_classes=act_dim).float()
+
+def forward_sequence(model, obs_raw, acts_onehot, h_init, device, preprocess_obs_fn):
+    logits_l, vals_l, nlls_l, kls_l, mus_l, logvars_l = [],[],[],[],[],[]
+    h_re = h_init.clone()
+    for t, o in enumerate(obs_raw):
+        o_t = preprocess_obs_fn(o)
+        a_prev = torch.zeros(model.nagents, model.act_dim, device=device) if t==0 else acts_onehot[t-1]
+        h_re, nll_s, kl_s, logits_s, _, vals_s, mu_s, logvar_s = \
+            model.forward_step(o_t, a_prev, h_re)
+        logits_l.append(logits_s); vals_l.append(vals_s)
+        nlls_l.append(nll_s); kls_l.append(kl_s)
+        mus_l.append(mu_s); logvars_l.append(logvar_s)
+    return logits_l, vals_l, nlls_l, kls_l, mus_l, logvars_l
+
+def close_env_and_figures(env):
+    # 환경 닫기
+    try:
+        if hasattr(env, 'close'):
+            env.close()
+        elif hasattr(env, 'env') and hasattr(env.env, 'close'):
+            env.env.close()
+        elif hasattr(env, 'unwrapped') and hasattr(env.unwrapped, 'close'):
+            env.unwrapped.close()
+        # matplotlib 창들도 닫기
+        plt.close('all')
+        # 잠시 대기하여 렌더링 창이 완전히 닫히도록 함
+        import time
+        time.sleep(0.5)
+    except Exception as e:
+        print(f"환경 닫기 중 오류 발생 (무시됨): {e}")
+
+def plot_success_rate(success_list, save_path=None, window=20, task_name=None):
+    import matplotlib.pyplot as plt
+    arr = np.array(success_list, dtype=np.float32)
+    ma = np.convolve(arr, np.ones(window)/window, mode='valid')
+    plt.figure(figsize=(8,4))
+    plt.plot(arr, label='Success (per episode)', alpha=0.3)
+    plt.plot(np.arange(window-1, len(arr)), ma, label=f'Moving Avg (window={window})', color='orange')
+    plt.ylim(-0.05, 1.05)
+    plt.xlabel('Episode')
+    plt.ylabel('Success')
+    plt.title(f'Success Rate ({task_name})' if task_name else 'Success Rate')
+    plt.legend()
+    if save_path:
+        plt.savefig(save_path)
+        plt.close()
+    else:
+        plt.show()
+
+def plot_batch_success_rate(batch_success_rates, save_path=None, task_name=None):
+    import matplotlib.pyplot as plt
+    arr = np.array(batch_success_rates, dtype=np.float32)
+    plt.figure(figsize=(8,4))
+    plt.plot(arr, marker='o', label='Batch Success Rate')
+    plt.ylim(-0.05, 1.05)
+    plt.xlabel('Batch')
+    plt.ylabel('Success Rate')
+    plt.title(f'Batch Success Rate ({task_name})' if task_name else 'Batch Success Rate')
+    plt.legend()
+    if save_path:
+        plt.savefig(save_path)
+        plt.close()
+    else:
+        plt.show()
+
+def save_training_plots(history, episode_returns, output_dir, env_name):
+    # 그래프 저장
+    plot_history(history, save_path=f"{output_dir}/training_history.png", task_name=env_name)
+    plot_episode_returns(episode_returns, save_path=f"{output_dir}/episode_returns.png", task_name=env_name)
+
 # ---------------------------------------------------------------------------
+# GPU 최적화된 Trainer 클래스
+# ---------------------------------------------------------------------------
+
 class Trainer:
-    """Trainer orchestrates rollout, update, logging, and plotting."""
+    """GPU 최적화된 Trainer - rollout, VAE pretraining, RL update, logging, plotting을 조율"""
     def __init__(
         self,
         env,
@@ -69,291 +203,341 @@ class Trainer:
         cfg,
         device: str | None = None,
         log_fn: Callable[[Dict[str, float], int], None] | None = None,
+        experiment_config: Dict[str, Any] | None = None,
     ) -> None:
-        # Device selection
+        # Device selection with optimization
         if device is None:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.device = torch.device(device)
+            self.device = get_device(cfg)
+        else:
+            self.device = torch.device(device)
 
         # Components
         self.env = env
         self.model = model.to(self.device)
         self.nagents = model.nagents
         self.cfg = cfg
+        self.experiment_config = experiment_config
 
-        # Separate VAE vs RL parameters by id
-        self.vae_params = list(self.model.vrnn_cells.parameters())  # VRNN encoder/decoder만
-        vae_param_ids = {id(p) for p in self.vae_params}
-        self.rl_params = [p for p in self.model.parameters() if id(p) not in vae_param_ids]
-        
-        # Optimizers
-        self.opt_vae = torch.optim.Adam(self.vae_params, lr=self.cfg.lr)
-        self.opt_rl  = torch.optim.Adam(self.rl_params,  lr=self.cfg.lr)
+        # Mixed precision 설정
+        self.use_mixed_precision = getattr(cfg, 'mixed_precision', False) and MIXED_PRECISION_AVAILABLE
+        if self.use_mixed_precision:
+            self.scaler = GradScaler('cuda')
+            print("Mixed precision 활성화")
+        else:
+            self.scaler = None
+
+        # Separate VAE vs RL parameters
+        self.vae_params = list(self.model.vrnn_cells.parameters())
+        vae_ids = {id(p) for p in self.vae_params}
+        self.rl_params  = [p for p in self.model.parameters() if id(p) not in vae_ids]
+
+        # Optimizers with different learning rates
         self.opt = torch.optim.Adam(self.model.parameters(), lr=cfg.lr)
+        self.opt_vae = torch.optim.Adam(self.vae_params, lr=cfg.lr_vae)
+        self.opt_rl  = torch.optim.Adam(self.rl_params,  lr=cfg.lr)
 
+        # Logging
         self.log_fn = log_fn or (lambda metrics, step: None)
-        # History and progress bar
         self.history = init_history([
             'vae_nll','vae_kl','coop_kl','loss_vae',
-            'policy_loss','value_loss','entropy','loss_rl',
-            'total_loss'
+            'policy_loss','value_loss','entropy','loss_rl','total_loss',
+            'grad_norm_vae','grad_norm_rl'
         ])
-        self.pbar = create_progress_bar(cfg.total_steps)
-
-        # success tracking per phase
-        self.num_phases = 10
-        self.phase_names = []
-        for i in range(self.num_phases):
-            start = int(i     / self.num_phases * 100)
-            end   = int((i+1) / self.num_phases * 100)
-            self.phase_names.append(f"{start}-{end}%")
         self.episode_returns: List[float] = []
-        self.episode_counts = [0] * self.num_phases
-        self.success_counts = [0] * self.num_phases
-         
+        self.batch_returns: List[np.ndarray] = []
+        
         # Hidden state
-        hdim = model.vrnn_cells[0].rnn.hidden_size
+        hdim = self.model.hidden_dim
         self.h = torch.zeros(self.nagents, hdim, device=self.device)
         
+        # --- rolling error buffer 추가 (K=10)
+        self.K = 10
+        self.rolling_errors = [deque(maxlen=self.K) for _ in range(self.nagents)]
+        
+        # --- 학습 안정성을 위한 gradient clipping 설정
+        self.max_grad_norm = getattr(cfg, 'clip_grad', 1.0)
+        
+        # --- Causal GAT 사용 확인
+        self.use_causal_gat = getattr(cfg, 'use_causal_gat', False)
+        if self.use_causal_gat and not hasattr(self.model, 'use_causal_gat'):
+            print("Warning: CausalGATLayer가 모델에 설정되지 않았습니다. configs.yaml에서 use_causal_gat: true로 설정하세요.")
+        
+        # --- 모델 정보 출력
+        print(f"\n Environment: {self.env.name}")
+        print(f" Operation on {self.device}")
+        print(f" Mixed Precision: {self.use_mixed_precision}")
+        print(f" Model Configuration:")
+        print(f"  - Use RNN: {self.model.use_rnn}")
+        print(f"  - Use GAT: {self.model.use_gat}")
+        print(f"  - Use Causal GAT: {getattr(self.model, 'use_causal_gat', False)}")
+        print(f"  - Hidden Dim: {self.model.hidden_dim}")
+        print(f"  - GAT Dim: {self.model.gat_dim}")
+        print(f"  - Z Dim: {self.model.z_dim}")
+        print(f"  - Number of Agents: {self.nagents}")
+        
+        self.pbar = create_progress_bar(cfg.total_steps)
+    
+    def _update_rolling_errors(self, nlls: torch.Tensor):
+        # nlls: (N,) tensor
+        for i in range(self.nagents):
+            self.rolling_errors[i].append(float(nlls[i].item()))
 
-    def preprocess_obs(self, obs) -> torch.Tensor:
+    def get_rolling_mean_errors(self):
+        # 각 agent별 rolling mean 반환 (N,) torch tensor
+        means = []
+        for i in range(self.nagents):
+            if len(self.rolling_errors[i]) > 0:
+                means.append(sum(self.rolling_errors[i]) / len(self.rolling_errors[i]))
+            else:
+                means.append(0.0)
+        return torch.tensor(means, dtype=torch.float32, device=self.device)
+
+    def _rollout(self, render_freq: int = 0) -> List[Tuple]:
         """
-        Env 관측을 (N, D) torch Tensor로 변환한다.
-        • obs가 ((arr0, arr1), info) 같이 중첩 튜플일 때도 지원
-        • obs가 1-D numpy 배열일 경우 → N 에이전트로 broadcast
-        """
-        # 1. (obs, info) 형태라면 info 버리고 obs만 남김
-        if isinstance(obs, tuple) and len(obs) == 2 and isinstance(obs[1], dict):
-            obs, _ = obs                           # obs ← (arr0, arr1)
-
-        # 2. 에이전트별 배열 튜플/리스트
-        if isinstance(obs, (tuple, list)):
-            # np.stack 전에 dtype·shape 정규화
-            arr = np.stack([np.asarray(o, dtype=np.float32) for o in obs], axis=0)
-            tensor = torch.as_tensor(arr, dtype=torch.float32, device=self.device)
-            return tensor                          # shape (N, D)
-
-        # 3. 단일 np.ndarray → 모든 에이전트에 동일 관측 broadcast
-        if isinstance(obs, np.ndarray):
-            arr = obs.astype(np.float32)
-            if arr.ndim == 1:                      # (D,) → (1, D)
-                arr = arr[None, :]
-            tensor = torch.as_tensor(arr, dtype=torch.float32, device=self.device)
-            # self.nagents 이 정의돼 있다면 필요 시 확장
-            if hasattr(self, "N") and tensor.size(0) == 1 and self.nagents > 1:
-                tensor = tensor.expand(self.nagents, -1)  # (N, D)
-            return tensor
-
-        raise TypeError(f"Unsupported obs type: {type(obs)}")
-
-    def _rollout(self) -> Tuple[List[Tuple], List[Dict]]:
-        """
-        Collect a fixed number of episodes defined by cfg.batch_size.
-        Returns trajectories and logs across all episodes.
+        GPU 최적화된 rollout with optional real-time rendering
         """
         traj: List[Tuple] = []
-        log_l: List[Dict] = []
         episodes = 0
+        step_count = 0
+        # --- 배치 내 에피소드별 return을 임시 저장
+        batch_episode_returns = []
         
-        while episodes < self.cfg.batch_size:
-            # episode start
-            self.h = torch.zeros_like(self.h)  # reset hidden state
+        while episodes < self.cfg.ep_num:
+            self.h.zero_()
             obs = self.env.reset()
-            
             done = False
             if not hasattr(self, 'last_action'):
-                self.last_action = torch.zeros(self.nagents, self.model.act_dim, device=self.device)
-            ep_ret = np.zeros(self.nagents, dtype=np.float32)
-
+                self.last_action = torch.zeros(
+                    self.nagents, self.model.act_dim, device=self.device
+                )
+            
+            # --- rollout 시작 시 rolling error 초기화
+            self.rolling_errors = [deque(maxlen=self.K) for _ in range(self.nagents)]
+            
+            # --- Causal GAT를 위한 이전 GAT 출력 초기화
+            if hasattr(self.model, 'prev_gat_output'):
+                self.model.prev_gat_output = None
+            
             while not done:
-                self.env.render()
-                # inference
                 self.model.eval()
+                
+                if not self.env.name == 'dectiger':
+                    # Render if enabled and at the right frequency
+                    if render_freq > 0 and step_count % render_freq == 0:
+                        self.env.render(mode='human')
+                
                 with torch.no_grad():
                     obs_t = self.preprocess_obs(obs)
-                    h_new, nlls, kls, logits, values, _, _ \
-                        = self.model.forward_step(obs_t, self.last_action, self.h)
+                    # rolling mean error 계산
+                    rolling_mean_error = self.get_rolling_mean_errors()                  
+                    h_new, nlls, kls, logits, ref_logits, values, mu, logvar, zs, V_gat, belief_consis_loss = \
+                        self.model.forward_step(obs_t, self.last_action, self.h, rolling_mean_error=rolling_mean_error)
                     self.h = h_new.detach()
-                acts = sample_actions(logits)
-                
+                    acts = sample_actions(logits)
+
                 self.last_action = F.one_hot(acts, num_classes=self.model.act_dim).float()
                 next_obs, reward, done, truncated, info = self.env.step(tuple(acts.cpu().tolist()))
+                # --- nlls를 rolling error에 저장
+                self._update_rolling_errors(nlls)
                 
-                rew_arr = np.asarray(reward, dtype=np.float32)
-                ep_ret += rew_arr 
-                # store transition
                 traj.append((
-                    obs, 
-                    acts.cpu().numpy(), 
-                    rew_arr,
-                    values.cpu().numpy(), 
-                    nlls.cpu().numpy(), 
-                    kls.cpu().numpy(),
-                    done, 
-                    logits.cpu().numpy()  
+                    obs,
+                    acts.cpu().numpy(),
+                    np.asarray(reward, np.float32),
+                    values.cpu().numpy(),
+                    done,
                 ))
-                # # log for diagnostics
-                # log = {
-                #     'state': info['state'],
-                #     'action': info['action'],
-                #     'reward': reward,
-                #     'obs': obs,
-                #     'next_obs': info['obs0'],
-                # }
-                # log_l.append(log)
                 obs = next_obs
-            self.episode_returns.append(ep_ret)
+                step_count += 1
+                
+            # 에이전트별 리턴 벡터로 기록
+            rewards = []
+            for _,_,r,_,done in traj:
+                rewards.append(r)
+                if done:
+                    break
+            rewards = np.array(rewards)
+            agent_returns = rewards.sum(axis=0)  # (n_agents,)
+            # --- 배치 내 에피소드별 return 저장
+            batch_episode_returns.append(agent_returns)
             episodes += 1
+        
+        # --- 배치가 끝나면 평균 계산하여 저장
+        batch_avg_returns = np.mean(batch_episode_returns, axis=0)  # (n_agents,)
+        self.batch_returns.append(batch_avg_returns)
+        return traj
 
-        return traj, log_l
+    def log_metrics(self, vae_metrics, rl_metrics, total_loss, grad_norms=None):
+        metrics = {**vae_metrics, **rl_metrics, 'total_loss': total_loss.item()}
+        if grad_norms is not None:
+            metrics['grad_norm_vae'] = grad_norms['vae']
+            metrics['grad_norm_rl'] = grad_norms['rl']
+        update_history(self.history, metrics)
+        self.pbar.update()
 
     def train(self):
+        """
+        GPU 최적화된 훈련 루프
+        """
         self.model.train()
-        self.last_obs = self.env.reset()
-
-        # Save initial hidden to re-evaluate sequence
         h_initial = self.h.clone()
-        phase_size = int(self.cfg.total_steps / len(self.episode_counts))
         
-        # Main training loop
         for global_step in range(self.cfg.total_steps):
-            # Collect rollout
-            traj, log_l = self._rollout()
+            # 메모리 최적화
+            if global_step % 10 == 0:
+                optimize_memory()
+            
+            traj = self._rollout(render_freq=0)
+            # trajectory unpack
+            _, data = unpack_trajectory(traj)
+            
+            # GAE 계산 전 shape 보정
+            vals = np.array(data['vals'])
+            rews = np.array(data['rews'])
+            dones = np.array(data['dones'])
 
-            # Unpack trajectory
-            obs_raw  = [s[0] for s in traj] # one timestep
-            acts_np  = np.stack([s[1] for s in traj], axis=0)
-            rews_np  = np.array([s[2] for s in traj], dtype=np.float32)
-            vals_np  = np.stack([s[3] for s in traj], axis=0)
-            nlls_np  = np.stack([s[4] for s in traj], axis=0)
-            kls_np   = np.stack([s[5] for s in traj], axis=0)
-            dones_np = np.array([s[6] for s in traj], dtype=np.float32)
-            old_logits_np = np.stack([s[7] for s in traj], axis=0)  # prev logits 
+            # (T, N, 1) -> (T, N)
+            if vals.ndim == 3 and vals.shape[2] == 1:
+                vals = vals.squeeze(-1)
+            if rews.ndim == 3 and rews.shape[2] == 1:
+                rews = rews.squeeze(-1)
+            if dones.ndim == 3 and dones.shape[2] == 1:
+                dones = dones.squeeze(-1)
 
-            # if global_step > 0.95*self.cfg.total_steps:
-            #     for log in log_l:
-            #         print(log['state'])
-            #         print(log['action'])
-            #         pass
-            # track success per phase
-            # for done, rew in zip(dones_np, rews_np):
-            #     if done:
-            #         phase = min(int(global_step // phase_size), self.num_phases - 1)
-            #         self.episode_counts[phase] += 1 
-            #         if rew == 2.0:
-            #             self.success_counts[phase] += 1
-
-            # Advantage & returns
             adv_np, gae_ret_np = compute_gae_multi(
-                rews_np, vals_np, dones_np,
+                rews, vals, dones,
                 self.cfg.gamma, self.cfg.gae_lambda
             )
-            # Flatten & Transform into tensor
-            act_t = torch.from_numpy(acts_np.flatten()).long().to(self.device)
-            adv_t = torch.from_numpy(adv_np.flatten()).float().to(self.device)
-            gae_ret_t = torch.from_numpy(gae_ret_np.flatten()).float().to(self.device)
-            # old_logits_np: shape (T, N, A) → reshape to (B=T*N, A)
-            T, N, A = old_logits_np.shape
-            old_logits_t = torch.from_numpy(old_logits_np.reshape(T * N, A)).float().to(self.device)
             
-            # Re-evaluate under grad with RNN state progression
+            # Flatten & to tensor (GPU 최적화)
+            act_t = to_torch(data['acts'], self.device, flatten=True, dtype=torch.long)
+            adv_t = to_torch(adv_np, self.device, flatten=True, dtype=torch.float)
+            gae_ret_t = to_torch(gae_ret_np, self.device, flatten=True, dtype=torch.float)
+            
+            # Re-evaluate sequence under grad (모든 학습용 값은 여기서 모델로 얻음)
+            obs_raw = data['obs']
+            acts_np = data['acts']
+            acts = torch.from_numpy(acts_np).long().to(self.device)
+            acts_onehot = F.one_hot(acts, num_classes=self.model.act_dim).float()
+            logits_l, vals_l, nlls_l, kls_l, mus_l, logvars_l, zs_l, Vgat_l = [],[],[],[],[],[],[],[]
+            
             self.model.train()
-            logits_l, vals_l, nlls_l, kls_l, mus_l, logvars_l = [], [], [], [], [], []
-
-            # 뒤에서 act_np를 one-hot 텐서로 변환
-            acts = torch.from_numpy(acts_np).long().to(self.device)                         # (T, N)
-            acts_onehot = F.one_hot(acts, num_classes=self.model.act_dim).float()          # (T, N, act_dim)
-
-            # RNN 은닉 초기화
-            h_re = h_initial.clone()
-
-            # 시계열 재평가
-            for t, o in enumerate(obs_raw):
-                o_t = self.preprocess_obs(o)  # (N, obs_dim)
-                # t=0일 땐 이전 액션이 없으므로 모두 0 벡터
-                if t == 0:
-                    a_prev = torch.zeros(self.nagents, self.model.act_dim, device=self.device)
-                else:
-                    a_prev = acts_onehot[t-1]   # (N, act_dim)
-
-                # forward_step에 obs, a_prev, h_re 순서로 넘겨줌
-                h_re, nll_s, kl_s, logits_s, vals_s, mu_s, logvar_s  = \
-                    self.model.forward_step(o_t, a_prev, h_re)
-
-                logits_l.append(logits_s)
-                vals_l  .append(vals_s)
-                nlls_l  .append(nll_s)
-                kls_l   .append(kl_s)
-                mus_l   .append(mu_s)
-                logvars_l.append(logvar_s)
-                
-            # Stack into batch B = T * N
-            logits_t = torch.vstack(logits_l)                    # (B, act_dim)
-            val_t    = torch.cat( vals_l,   dim=0)               # (B,)
-            nll_t    = torch.cat([x.unsqueeze(1) for x in nlls_l], dim=0).squeeze()  # (B,)
-            kl_t     = torch.cat([x.unsqueeze(1) for x in kls_l],  dim=0).squeeze()  # (B,)
-            mu_t     = torch.vstack(mus_l)                       # (B, d)
-            logvar_t = torch.vstack(logvars_l)                   # (B, d)
+            h_re = self.h.clone()
             
-            # Compute VAE loss with coop KL
-            loss_vae, vae_metrics = compute_vae_loss(
-                nll_t, kl_t,
-                mu_t, logvar_t,
-                nll_coef=self.cfg.nll_coef,
-                kl_coef=self.cfg.kl_coef,
-                coop_coef=self.cfg.coop_coef,
-                n_agents=self.nagents
-            )
+            # Mixed precision context
+            autocast_context = autocast('cuda') if self.use_mixed_precision else nullcontext()
+            
+            with autocast_context:
+                for t, o in enumerate(obs_raw):
+                    o_t = self.preprocess_obs(o)
+                    a_prev = torch.zeros(self.nagents, self.model.act_dim, device=self.device) if t==0 else acts_onehot[t-1]
+                    # --- rolling mean error 계산
+                    rolling_mean_error = self.get_rolling_mean_errors()
+                    h_re, nll_s, kl_s, logits_s, _, vals_s, mu_s, logvar_s, zs_s, V_gat_s, belief_consis_loss = \
+                        self.model.forward_step(o_t, a_prev, h_re, rolling_mean_error=rolling_mean_error)
+                    # --- nlls를 rolling error에 저장
+                    self._update_rolling_errors(nll_s)
+                    logits_l.append(logits_s); vals_l.append(vals_s)
+                    nlls_l.append(nll_s); kls_l.append(kl_s)
+                    mus_l.append(mu_s); logvars_l.append(logvar_s)
+                    zs_l.append(zs_s); Vgat_l.append(V_gat_s)
 
-            # # RL loss
-            # loss_rl, rl_metrics = compute_rl_loss(
-            #     logits_t, act_t, adv_t, val_t, gae_ret_t,
-            #     ent_coef=self.cfg.ent_coef,
-            #     value_coef=self.cfg.value_coef
-            # )
-            # PPO loss
-            loss_rl, rl_metrics = compute_rl_ppo_loss(
-                logits_t,            # new logits
-                old_logits_t,        # old logits
-                act_t,               # actions
-                adv_t,               # advantages
-                gae_ret_t,           # returns
-                clip_eps=0.2,
-                ent_coef=self.cfg.ent_coef,
-                value_coef=self.cfg.value_coef,
-                values_pred=val_t    # predicted values
-            )
+                logits_t = torch.vstack(logits_l)
+                val_t    = torch.cat(vals_l, dim=0).squeeze()
+                nll_t    = torch.cat([x.unsqueeze(1) for x in nlls_l], dim=0).squeeze()
+                kl_t     = torch.cat([x.unsqueeze(1) for x in kls_l], dim=0).squeeze()
+                mu_t     = torch.vstack(mus_l)
+                logvar_t = torch.vstack(logvars_l)
+                
+                # ActorCriticHead를 사용한 표준 RL loss 계산
+                loss_rl, rl_metrics = compute_rl_loss(
+                    logits_t, act_t, adv_t, val_t, gae_ret_t, 
+                    ent_coef=self.cfg.ent_coef, 
+                    value_coef=self.cfg.value_coef
+                )
+                
+                # VAE loss
+                mu_t = mu_t.view(-1, mu_t.shape[-1])
+                logvar_t = logvar_t.view(-1, logvar_t.shape[-1])
+                loss_vae, vae_metrics = compute_vae_loss(
+                    nll_t, kl_t, mu_t, logvar_t,
+                    nll_coef=getattr(self.cfg, 'nll_coef', 1.0),
+                    kl_coef=getattr(self.cfg, 'kl_coef', 1.0),
+                    coop_coef=getattr(self.cfg, 'coop_coef', 1.0),
+                    n_agents=self.nagents
+                )
+                
+                # Belief consistency loss는 forward_step에서 반환됨
+                total_loss = loss_vae + loss_rl# + belief_consis_loss
 
-            rollout_return = float(np.sum(rews_np))
-            rl_metrics['return'] = rollout_return
+            # Mixed precision backward pass
+            if self.use_mixed_precision and self.scaler is not None:
+                self.scaler.scale(total_loss).backward()
+                self.scaler.unscale_(self.opt_vae)
+                self.scaler.unscale_(self.opt_rl)
+            else:
+                total_loss.backward()
 
-            # backward & step
+            # Gradient clipping 적용 및 norm 계산
+            grad_norm_vae = torch.nn.utils.clip_grad_norm_(self.vae_params, self.max_grad_norm)
+            grad_norm_rl = torch.nn.utils.clip_grad_norm_(self.rl_params, self.max_grad_norm)
+            
+            # Mixed precision optimizer step
+            if self.use_mixed_precision and self.scaler is not None:
+                self.scaler.step(self.opt_vae)
+                self.scaler.step(self.opt_rl)
+                self.scaler.update()
+            else:
+                self.opt_vae.step()
+                self.opt_rl.step()
+
+            # 그래디언트 초기화
             self.opt_vae.zero_grad()
             self.opt_rl.zero_grad()
-            # self.opt.zero_grad()
-            total_loss = loss_vae  + loss_rl # Loss_VAE : Loss_RL = 50 : 1
-            total_loss.backward()
-            # torch.nn.utils.clip_grad_norm_(self.vae_params, self.cfg.clip_grad)
-            # torch.nn.utils.clip_grad_norm_(self.rl_params, self.cfg.clip_grad)
-            self.opt_vae.step()
-            self.opt_rl.step()
-            # torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.clip_grad)
-            # self.opt.step()
+
+            # Logging with additional metrics
+            self.log_metrics(
+                vae_metrics, rl_metrics, total_loss,
+                grad_norms={'vae': grad_norm_vae, 'rl': grad_norm_rl}
+            )
             
-            # logging
-            self.pbar.update()
-            metrics = {**vae_metrics, **rl_metrics, 'total_loss': total_loss.item()}
-            update_history(self.history, metrics)
-            self.log_fn(metrics, global_step)
-
         self.pbar.close()
-        # Plot all metrics
-        plot_history(self.history)
+        
+        # 환경 렌더링 창 닫기 (다양한 환경 래퍼 지원)
+        close_env_and_figures(self.env)
+        
+        # 결과를 outputs 폴더에 저장
+        import os
+        from datetime import datetime
+        from src.utils import save_all_results
+        
+        # 현재 시간으로 폴더 생성
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        output_dir = f"outputs/{timestamp}"
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # 환경 이름 가져오기
+        env_name = getattr(self.env, 'name', 'unknown_env')
+        
+        # 모든 결과 저장 (설정 포함)
+        save_all_results(
+            history=self.history,
+            episode_returns=self.batch_returns,
+            save_dir=output_dir,
+            task_name=env_name,
+            config=self.experiment_config,
+            episode_counts=None,  # 페이즈별 데이터가 있는 경우 추가
+            success_counts=None,  # 페이즈별 데이터가 있는 경우 추가
+            phase_names=None      # 페이즈별 데이터가 있는 경우 추가
+        )
 
-        plot_episode_returns(self.episode_returns)
-        # plot_phase_success(
-        #     self.episode_counts,
-        #     self.success_counts,
-        #     phase_names=self.phase_names
-        # )
-
+    def preprocess_obs(self, obs) -> torch.Tensor:
+        """GPU 최적화된 관찰 전처리"""
+        if isinstance(obs, torch.Tensor):
+            return obs
+        if isinstance(obs, np.ndarray):
+            return torch.as_tensor(obs, dtype=torch.float32, device=self.device)
+        if isinstance(obs, (tuple, list)):
+            arr = np.stack([np.asarray(o, dtype=np.float32) for o in obs], axis=0)
+            return torch.as_tensor(arr, dtype=torch.float32, device=self.device)
+        raise TypeError(f"Unsupported obs type: {type(obs)}")

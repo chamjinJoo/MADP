@@ -1,9 +1,21 @@
-from src.train import Trainer
+import os
+# OpenMP 라이브러리 충돌 방지
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+
+from src.train import Trainer, get_device
 from src.models import VRNNGATA2C
+from src.utils import save_all_results
 from pathlib import Path
 from src.envs import DecTigerEnv
-import yaml, argparse
+from src.env_wrapper import (DecTigerWrapper, 
+                             RWAREWrapper, 
+                             SMAXGymWrapper, 
+                             MPEGymWrapper, 
+                             SwitchWrapper,
+                             PPWrapper,
+                             LBForagingWrapper,)
 
+import yaml, argparse
 import torch
 import random
 import numpy as np
@@ -22,73 +34,222 @@ def set_seed(seed: int):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark     = False
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--config", type=str, default=r"configs.yaml")
-parser.add_argument("--env",    type=str, default="dectiger")
-args = parser.parse_args()
+def create_env(env_name: str, env_cfg: dict, seed: int, device: torch.device | None = None):
+    """GPU 최적화된 환경 생성 함수"""
+    if env_name == 'dectiger':
+        env = DecTigerWrapper(proj_dim=16, seed=seed, )
+        obs_dim = env.obs_dim
+        act_dim = env.act_dim
+        nagents = env.n
 
-cfg  = yaml.safe_load(Path(args.config).read_text())
-task = args.env         
-task_cfg = cfg[task] 
+    elif env_name == "rware":
+        layout = env_cfg.get("layout", None)
+        env_name_str = f"rware:rware-tiny-{env_cfg['nagents']}ag-v2"
+        base_env = gym.make(env_name_str, layout=layout)
+        env = RWAREWrapper(base_env, )
+        obs_dim = env.obs_dim
+        act_dim = env.act_dim
+        nagents = env.n
+        
+    elif env_name == 'smax':
+        env = SMAXGymWrapper(map_name="2s3z", seed=seed, )
+        obs_dim = env.obs_dim
+        act_dim = env.act_dim
+        nagents = env.n
 
-SEED=cfg['seed'] # random seed for torch opeartion, not for env
-set_seed(SEED)
+    elif env_name == 'mpe': # simple-spread
+        env = MPEGymWrapper(
+            n_agents=env_cfg.get("nagents", 3),
+            local_ratio=env_cfg.get("local_ratio", 0.5),
+            max_cycles=env_cfg.get("max_cycles", 25),
+            continuous_actions=env_cfg.get("continuous_actions", False),
+            seed=seed,
+            
+            )
+        obs_dim = env.obs_dim
+        act_dim = env.act_dim
+        nagents = env.n
 
-if task == 'dectiger':
-    env = DecTigerEnv(seed=SEED)
-    env.seed(SEED) 
-    env.action_space.seed(SEED)
-    env.observation_space.seed(SEED)
-elif task == 'rware':
-    layout = """
-    .......
-    ...x...
-    ..x.x..
-    .x...x.
-    ..x.x..
-    ...x...
-    .g...g.
-    """
-    env_name = "rware:rware-tiny-"+str(task_cfg["nagents"])+"ag-v2"
-    env = gym.make(env_name, layout=layout)
-    obs_dim =71
-else:
-    ValueError("There is no such! Available envs are (dectiger, ...)")
+    elif env_name == 'speaker_listener': # simple-speaker-listener
+        env = SpeakerListenerWrapper(
+            max_cycles=env_cfg.get("max_cycles", 25),
+            continuous_actions=env_cfg.get("continuous_actions", False),
+            seed=seed,
+            
+            )
+        obs_dim = env.obs_dim
+        act_dim = env.act_dim
+        nagents = env.n
 
-env.nagents = task_cfg["nagents"]
+    elif env_name == 'switch':
+        env = SwitchWrapper(
+            step_cost = -0.1,
+            n_agents = 2,
+            max_steps = 50,
+            
+            )
+        obs_dim = env.obs_dim
+        act_dim = env.act_dim
+        nagents = env.n
 
-# obs_dim    = task_cfg["obs_dim"]
-# hidden_dim = task_cfg.get("hidden_dim", obs_dim)
-# z_dim      = task_cfg.get("z_dim",      obs_dim // 2)
-# gat_dim    = task_cfg.get("gat_dim",    obs_dim // 2)
+    elif env_name == 'pp':
+        env = PPWrapper(n_agents=2, 
+                        n_preys=1, 
+                        max_steps=100, 
+                        agent_view_mask=(5, 5),
+                        
+        )
+        obs_dim = env.obs_dim
+        act_dim = env.act_dim
+        nagents = env.n
 
-hidden_dim = task_cfg.get("hidden_dim")
-z_dim      = task_cfg.get("z_dim")
-gat_dim    = task_cfg.get("gat_dim")
+    elif env_name == 'foraging':
+        env = LBForagingWrapper(grid_size=8, 
+                                n_agents=3,
+                                n_food=2, 
+                                force_coop=True, 
+                                sight=2,
+                                seed=seed,
+                                
+        )
+        obs_dim = env.obs_dim
+        act_dim = env.act_dim
+        nagents = env.n
+        
+    elif env_name == 'blicket':
+        env = MultiAgentBlicketWrapper(n_agents=3,
+                                       n_blickets=3,
+                                       max_steps=20,
+                                       
+        )
+        obs_dim = env.obs_dim
+        act_dim = env.act_dim
+        nagents = env.n 
+    else:
+        raise ValueError(f"Unknown environment: {env_name}. Available envs are (dectiger, rware, smax, mpe, speaker_listener, switch, pp, foraging, blicket)")
 
-model = VRNNGATA2C(
-    obs_dim  = obs_dim,
-    act_dim  = task_cfg["act_dim"],
-    hidden_dim = hidden_dim,
-    z_dim      = z_dim,
-    gat_dim    = gat_dim,
-    n_agents   = task_cfg["nagents"],
-)
+    return env, obs_dim, act_dim, nagents
 
-from dataclasses import dataclass
-@dataclass
-class TrainConfig:
-    batch_size: int = 1       # the number of episodes per batch
-    total_steps: int = 1000
-    lr: float = 5e-4
-    gamma: float = 0.99
-    gae_lambda: float = 0.95
-    clip_grad: float = 1.0
-    coop_coef: float = 1.0
-    ent_coef: float = 0.01
-    kl_coef: float = 1.0
-    nll_coef: float = 1.0
-    value_coef: float = 1.0
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default=r"configs.yaml")
+    parser.add_argument("--env",    type=str, default="dectiger")
+    args = parser.parse_args()
 
-trainer = Trainer(env, model, TrainConfig)
-trainer.train()
+    # 설정 파일 로드 (UTF-8 인코딩 명시)
+    cfg = yaml.safe_load(Path(args.config).read_text(encoding='utf-8'))
+    env_name = args.env         
+    env_cfg = cfg[env_name] 
+
+    # 시드 설정
+    SEED = cfg['seed']
+    set_seed(SEED)
+
+    # GPU 디바이스 설정
+    device = get_device(cfg)
+    print(f"Using device: {device}")
+
+    # 환경 생성
+    env, obs_dim, act_dim, nagents = create_env(env_name, env_cfg, SEED, device)
+
+    # 모델 생성
+    model_cfg = cfg['model']
+    model = VRNNGATA2C(
+        obs_dim=obs_dim,
+        act_dim=act_dim,
+        hidden_dim=model_cfg['hidden_dim'],
+        z_dim=model_cfg['z_dim'],
+        gat_dim=model_cfg['gat_dim'],
+        n_agents=nagents,
+        use_gat=model_cfg['use_gat'],
+        use_causal_gat=model_cfg['use_causal_gat'],
+        use_rnn=model_cfg['use_rnn']
+    )
+    # 훈련 설정
+    from dataclasses import dataclass
+    @dataclass
+    class TrainConfig:
+        ep_num: int
+        total_steps: int
+        lr: float
+        lr_vae: float
+        gamma: float
+        gae_lambda: float
+        clip_grad: float
+        coop_coef: float
+        ent_coef: float
+        kl_coef: float
+        nll_coef: float
+        value_coef: float
+        mixed_precision: bool
+        ema_alpha: float
+        use_causal_gat: bool
+        
+        def __post_init__(self):
+            pass
+
+    # 훈련 실행
+    train_config = TrainConfig(
+        ep_num=cfg['training']['ep_num'],
+        total_steps=cfg['training']['total_steps'],
+        lr=float(cfg['training']['lr']),
+        lr_vae=float(cfg['training']['lr_vae']),
+        gamma=float(cfg['training']['gamma']),
+        gae_lambda=float(cfg['training']['gae_lambda']),
+        clip_grad=float(cfg['params']['max_grad_norm']),
+        coop_coef=float(cfg['training']['coop_coef']),
+        ent_coef=float(cfg['training']['ent_coef']),
+        kl_coef=float(cfg['training']['kl_coef']),
+        nll_coef=float(cfg['training']['nll_coef']),
+        value_coef=float(cfg['training']['value_coef']),
+        mixed_precision=cfg['params'].get('mixed_precision', False),
+        ema_alpha=float(cfg['training'].get('ema_alpha', 0.99)),
+        use_causal_gat=cfg.get('use_causal_gat', False)
+    )
+    
+    # 실험 설정을 딕셔너리로 변환
+    experiment_config = {
+        'env_name': env_name,
+        'env_config': env_cfg,
+        'model_config': model_cfg,
+        'training_config': {
+            'ep_num': train_config.ep_num,
+            'total_steps': train_config.total_steps,
+            'lr': train_config.lr,
+            'lr_vae': train_config.lr_vae,
+            'gamma': train_config.gamma,
+            'gae_lambda': train_config.gae_lambda,
+            'clip_grad': train_config.clip_grad,
+            'coop_coef': train_config.coop_coef,
+            'ent_coef': train_config.ent_coef,
+            'kl_coef': train_config.kl_coef,
+            'nll_coef': train_config.nll_coef,
+            'value_coef': train_config.value_coef,
+            'mixed_precision': train_config.mixed_precision,
+            'ema_alpha': train_config.ema_alpha,
+            'use_causal_gat': train_config.use_causal_gat
+        },
+        'params': cfg['params'],
+        'seed': SEED,
+        'device': str(device)
+    }
+    
+    # 모델 정보 추가
+    experiment_config.update({
+        'obs_dim': obs_dim,
+        'act_dim': act_dim,
+        'n_agents': nagents,
+        'hidden_dim': model_cfg['hidden_dim'],
+        'gat_dim': model_cfg['gat_dim'],
+        'z_dim': model_cfg['z_dim'],
+        'use_gat': model_cfg['use_gat'],
+        'use_causal_gat': model_cfg['use_causal_gat'],
+        'use_rnn': model_cfg['use_rnn']
+    })
+    
+    trainer = Trainer(env, model, train_config, device=str(device), 
+                     experiment_config=experiment_config)
+    trainer.train()
+
+if __name__ == "__main__":
+    main()
