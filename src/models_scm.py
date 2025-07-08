@@ -218,7 +218,8 @@ class MultiAgentActorCritic(nn.Module):
         # Actor
         self.actor_networks = nn.ModuleList([
             nn.Sequential(
-                nn.Linear(obs_dim + (gat_dim if use_gat else 0), hidden_dim),
+                nn.Linear(obs_dim + (gat_dim if use_gat else 0) + (gat_dim if use_causal_gat else 0), hidden_dim),
+                # nn.Linear((gat_dim if use_gat else 0) + (gat_dim if use_causal_gat else 0), hidden_dim),
                 nn.ReLU(),
                 nn.Linear(hidden_dim, hidden_dim),
                 nn.ReLU(),
@@ -228,7 +229,7 @@ class MultiAgentActorCritic(nn.Module):
         # Critic
         self.critic_networks = nn.ModuleList([
             nn.Sequential(
-                nn.Linear(obs_dim + (gat_dim if use_gat else 0), hidden_dim),
+                nn.Linear(obs_dim + (gat_dim if use_gat else 0) + (gat_dim if use_causal_gat else 0), hidden_dim),
                 nn.ReLU(),
                 nn.Linear(hidden_dim, hidden_dim),
                 nn.ReLU(),
@@ -257,13 +258,14 @@ class MultiAgentActorCritic(nn.Module):
         if self.use_causal_gat and self.use_gat:
             causal_features = self.causal_gat(observations, adj_matrix)
             if communication_features is not None:
-                communication_features = communication_features + causal_features
+                communication_features = torch.cat([communication_features, causal_features], dim=-1)
             else:
                 communication_features = causal_features
         # Actor
         actor_outputs = []
         for i in range(self.num_agents):
             if communication_features is not None:
+                # actor_input = communication_features[:, i]
                 actor_input = torch.cat([observations[:, i], communication_features[:, i]], dim=-1)
             else:
                 actor_input = observations[:, i]
@@ -274,6 +276,7 @@ class MultiAgentActorCritic(nn.Module):
         critic_outputs = []
         for i in range(self.num_agents):
             if communication_features is not None:
+                # critic_input = communication_features[:, i] 
                 critic_input = torch.cat([observations[:, i], communication_features[:, i]], dim=-1)
             else:
                 critic_input = observations[:, i]
@@ -340,3 +343,44 @@ class MultiAgentActorCritic(nn.Module):
         identity = torch.eye(causal_structure.shape[0], device=causal_structure.device)
         identity_loss = F.mse_loss(causal_structure, identity)
         return sparsity_loss + identity_loss
+
+    def compute_do_intervention_loss_all(self, observations, actions, next_observations, do_action_tensor):
+        """
+        모든 agent에 대해 do-연산(intervention) loss 계산
+        do_action_tensor: (agents, action_dim) 또는 (batch, agents, action_dim)
+        """
+        batch_size, num_agents, action_dim = actions.shape
+        total_loss = 0.0
+        for agent_idx in range(num_agents):
+            intervened_actions = actions.clone()
+            if do_action_tensor.dim() == 2:
+                # (agents, action_dim)
+                intervened_actions[:, agent_idx] = do_action_tensor[agent_idx]
+            else:
+                # (batch, agents, action_dim)
+                intervened_actions[:, agent_idx] = do_action_tensor[:, agent_idx]
+            scm_predictions = self.scm(observations, intervened_actions)
+            # agent_idx의 next_obs만 loss로 쓸 수도 있지만, 여기선 전체 MSE 사용
+            loss = F.mse_loss(scm_predictions, next_observations)
+            total_loss = total_loss + loss
+        return total_loss / num_agents
+
+    def compute_counterfactual_loss_all(self, observations, actions, next_observations, cf_action_tensor):
+        """
+        모든 agent에 대해 counterfactual loss 계산
+        cf_action_tensor: (agents, action_dim) 또는 (batch, agents, action_dim)
+        """
+        batch_size, num_agents, action_dim = actions.shape
+        total_loss = 0.0
+        for agent_idx in range(num_agents):
+            cf_actions = actions.clone()
+            if cf_action_tensor.dim() == 2:
+                # (agents, action_dim)
+                cf_actions[:, agent_idx] = cf_action_tensor[agent_idx]
+            else:
+                # (batch, agents, action_dim)
+                cf_actions[:, agent_idx] = cf_action_tensor[:, agent_idx]
+            cf_predictions = self.scm(observations, cf_actions)
+            loss = F.mse_loss(cf_predictions, next_observations)
+            total_loss = total_loss + loss
+        return total_loss / num_agents

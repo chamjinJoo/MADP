@@ -190,17 +190,17 @@ def plot_episode_returns(episode_returns, save_path: str = "episode_returns.png"
     plt.figure(figsize=(8,4))
 
     if ep_arr.ndim == 1:          # 스칼라 리턴
-        plt.plot(batches, ep_arr, label="total", alpha=0.3)
+        plt.plot(batches, ep_arr, label="total", alpha=0.1)
         # 이동평균
-        window = 10  # 배치 기준으로 window 크기 조정
+        window = 20  # 배치 기준으로 window 크기 조정
         if len(ep_arr) >= window:
             ma = np.convolve(ep_arr, np.ones(window)/window, mode="valid")
             plt.plot(batches[window-1:], ma, lw=2, label=f"{window}-batch mean")
     else:                         # 에이전트별
-        window = 10  # 배치 기준으로 window 크기 조정
+        window = 20  # 배치 기준으로 window 크기 조정
         for i in range(ep_arr.shape[1]):
             # raw return (옅은 색)
-            plt.plot(batches, ep_arr[:, i], label=f"agent {i} (raw)", alpha=0.3)
+            plt.plot(batches, ep_arr[:, i], label=f"agent {i} (raw)", alpha=0.1)
             # 이동평균 (진한 색)
             if len(ep_arr[:, i]) >= window:
                 ma = np.convolve(ep_arr[:, i], np.ones(window)/window, mode="valid")

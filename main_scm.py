@@ -59,7 +59,7 @@ def create_env(env_name: str, env_cfg: dict, seed: int, device: torch.device | N
     elif env_name == 'switch':
         env = SwitchWrapper(
             step_cost = -0.1,
-            n_agents = 2,
+            n_agents = 3,
             max_steps = 50,
         )
         obs_dim = env.obs_dim

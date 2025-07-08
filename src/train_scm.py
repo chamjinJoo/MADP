@@ -117,7 +117,8 @@ class SCMTrainer:
         self.nagents = model.num_agents
         self.cfg = cfg
         self.history = init_history([
-            'scm_loss', 'causal_consistency_loss', 'policy_loss', 'value_loss', 'entropy', 'loss_rl', 'total_loss', 'grad_norm'
+            'scm_loss', 'causal_consistency_loss', 'do_loss', 'cf_loss',
+            'policy_loss', 'value_loss', 'entropy', 'loss_rl', 'total_loss', 'grad_norm'
         ])
         self.episode_returns: List[float] = []
         self.batch_returns: List[np.ndarray] = []
@@ -216,6 +217,23 @@ class SCMTrainer:
             causal_consistency_loss = self.model.compute_causal_consistency_loss(causal_structure)
             # --- causal structure 저장 (detach, cpu, numpy)
             self.causal_structure_list.append(causal_structure.detach().cpu().numpy())
+
+            # do-연산 및 counterfactual loss 추가 (모든 agent)
+            # 각 agent별로 무작위 action을 선택하여 intervention/counterfactual로 사용
+            num_agents = actions_torch.shape[1]
+            action_dim = actions_torch.shape[2]
+            do_action_tensor = torch.zeros(num_agents, action_dim, device=actions_torch.device)
+            cf_action_tensor = torch.zeros(num_agents, action_dim, device=actions_torch.device)
+            for i in range(num_agents):
+                do_idx = int(torch.randint(0, action_dim, (1,)))
+                cf_idx = int(torch.randint(0, action_dim, (1,)))
+                do_action_tensor[i, do_idx] = 1.0
+                cf_action_tensor[i, cf_idx] = 1.0
+            do_loss = self.model.compute_do_intervention_loss_all(obs_torch, actions_torch, next_obs_torch, do_action_tensor)
+            cf_loss = self.model.compute_counterfactual_loss_all(obs_torch, actions_torch, next_obs_torch, cf_action_tensor)
+            lambda_do = 1.0  # 필요시 조정
+            lambda_cf = 1.0  # 필요시 조정
+
             # RL loss (actor/critic)
             outputs = self.model(obs_torch)
             logits = outputs['actor_outputs'].view(-1, self.model.action_dim)
@@ -225,7 +243,7 @@ class SCMTrainer:
             probs = F.softmax(logits, dim=-1)
             entropy = -(probs * F.log_softmax(logits, dim=-1)).sum(dim=-1).mean()
             loss_rl = policy_loss + self.cfg.value_coef * value_loss - self.cfg.ent_coef * entropy
-            total_loss = scm_loss + causal_consistency_loss + loss_rl
+            total_loss = scm_loss + causal_consistency_loss + loss_rl + lambda_do * do_loss + lambda_cf * cf_loss
             total_loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
             self.opt.step()
@@ -233,6 +251,8 @@ class SCMTrainer:
             metrics = {
                 'scm_loss': scm_loss.item(),
                 'causal_consistency_loss': causal_consistency_loss.item(),
+                'do_loss': float(do_loss),
+                'cf_loss': float(cf_loss),
                 'policy_loss': policy_loss.item(),
                 'value_loss': value_loss.item(),
                 'entropy': entropy.item(),
@@ -271,13 +291,6 @@ class SCMTrainer:
             print(f"최종 RL loss: {self.history['loss_rl'][-1]:.4f}")
         if len(self.batch_returns) > 0:
             print(f"최종 평균 리턴: {self.batch_returns[-1]}")
-        # 그래프 저장 및 출력
-        try:
-            plot_history(self.history, save_path=f"{output_dir}/training_history.png", task_name=env_name)
-            plot_episode_returns(self.batch_returns, save_path=f"{output_dir}/episode_returns.png", task_name=env_name)
-            print(f"그래프가 {output_dir}에 저장되었습니다.")
-        except Exception as e:
-            print(f"그래프 저장/출력 중 오류: {e}")
         # --- causal structure 변화 시각화 ---
         try:
             self.plot_causal_structure_evolution(output_dir)
@@ -310,7 +323,7 @@ class SCMTrainer:
         plt.xlabel('Cause')
         plt.ylabel('Effect')
         plt.savefig(f"{output_dir}/causal_structure_last.png")
-        plt.close()
+        plt.show()
         # (2) 각 entry별 변화 라인플롯
         plt.figure(figsize=(8,6))
         for i in range(N):
@@ -322,7 +335,7 @@ class SCMTrainer:
         plt.legend(bbox_to_anchor=(1.05,1), loc='upper left', fontsize='small')
         plt.tight_layout()
         plt.savefig(f"{output_dir}/causal_structure_evolution.png")
-        plt.close()
+        plt.show()
 
 # ---------------------------------------------------------------------------
 # 메인 실행 예시 (실제 실험에서는 configs.yaml 등에서 파라미터 로드 필요)
