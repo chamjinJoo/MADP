@@ -1,0 +1,96 @@
+# configs.yaml - UTF-8 인코딩
+seed: 42
+
+# GPU 및 성능 최적화 설정
+params:
+  cuda: False  # GPU 사용 활성화
+  device: "cuda"  # 명시적 디바이스 지정
+  mixed_precision: True  # Mixed precision 사용
+  gradient_accumulation_steps: 1  # 그래디언트 누적 스텝
+  max_grad_norm: 1.0  # 그래디언트 클리핑
+  batch_size: 32  # 배치 크기
+  num_workers: 4  # 데이터 로딩 워커 수
+  pin_memory: True  # 메모리 핀닝
+  prefetch_factor: 2  # 프리페치 팩터
+
+# 로깅 설정
+logger:
+  logger: tensorboard 
+  logdir: logs
+  log_interval: 10  # 로깅 간격
+  save_interval: 100  # 모델 저장 간격
+
+# 모델 하이퍼파라미터
+model:
+  use_gat: True
+  use_causal_gat: True
+  use_rnn: True
+  hidden_dim: 48
+  z_dim: 16
+  gat_dim: 16
+  act_dim: 3
+
+# 학습 하이퍼파라미터
+training:
+  lr: 3e-4  # 학습률
+  lr_vae: 1e-4  # VAE 학습률
+  gamma: 0.99  # 할인 팩터
+  gae_lambda: 0.95  # GAE 람다
+  ent_coef: 0.01  # 엔트로피 계수
+  value_coef: 1.0  # 가치 함수 계수
+  nll_coef: 1.0  # NLL 계수
+  kl_coef: 0.1  # KL 계수
+  coop_coef: 0.1  # 협력 계수
+  ema_alpha: 0.99  # EMA 알파
+  total_steps: 3000  # 총 학습 스텝
+  ep_num: 5  # 에피소드 수
+
+dectiger:
+  task: dectiger
+  run: {steps: 2, train_ratio: 64}
+  maxtimestep: 2
+  obs_dim: 16
+  nagents: 2
+
+rware:
+  task: rware
+  nagents: 2
+  layout: |
+    .x..x.
+    .x..x.
+    ......
+    ..gg..
+
+mpe:
+  task: mpe_simple_spread
+  nagents: 3
+
+speaker_listener:
+  task: speaker_listener
+  max_cycles: 25
+  continuous_actions: False
+
+smax:
+  task: smax # 2s3z
+  nagents: 5
+
+switch:
+  task: switch
+  nagents: 2
+ 
+pp:
+  task: pp
+  nagents: 2
+
+foraging:
+  task: foraging
+  nagents: 2
+
+blicket:
+  task: blicket
+  nagents: 3
+  n_blickets: 3
+  reward_structure: "quiz-type"
+  quiz_positive_reward: 1.0
+  quiz_negative_reward: -1.0
+  quiz_disabled_steps: 5
