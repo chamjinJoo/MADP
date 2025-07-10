@@ -1,159 +1,386 @@
-# MADP (Multi-Agent Deep Policy) - GPU 최적화 버전
+# [SCM/GAT 기반 Causal Reasoning 모델]
 
-멀티에이전트 강화학습 프레임워크입니다.
+## 1. 전체 구조 개요
+- 본 구조는 Multi-Agent 환경(특히 Dec-POMDP)에서 **인과 추론(causal reasoning)**을 통합한 Actor-Critic 계열 강화학습 모델임.
+- 주요 구성요소:
+    - **SCM(Structural Causal Model)**: 에이전트 간 인과관계 행렬 학습
+    - **GAT(Graph Attention Network)**: SCM의 인과구조를 어텐션에 반영한 통신
+    - **CausalGAT**: SCM과 인과구조를 공유하는 GAT
+    - **Actor/Critic**: 각 에이전트별 정책/가치 함수
+    - **중앙집중 Critic**: MADDPG 스타일의 중앙집중 가치 함수
 
-## 🚀 주요 기능
+---
 
-- **GPU 최적화**: Mixed precision, 메모리 효율성, 배치 처리 최적화
-- **다양한 환경 지원**: DecTiger, RWARE, MPE, Speaker-Listener, SMAX, Switch, Predator-Prey, Level-Based Foraging
-- **고급 아키텍처**: VRNN + GAT + Actor-Critic
-- **Causal GAT**: 인과적 추론을 위한 다중 헤드 어텐션
-- **Mixed Precision**: 메모리 사용량 절약 및 훈련 속도 향상
-- **실험 관리**: 하이퍼파라미터 및 설정 자동 저장, 결과 추적
+## 2. 데이터 흐름 및 처리 과정
 
-## 📋 모델 개요 및 아키텍처
+### (1) 환경에서의 데이터 흐름
+- 각 step마다 환경(env)에서 다음과 같은 데이터가 생성됨:
+    - `obs`: 각 에이전트의 관측값 (obs_dim)
+    - `acts`: 각 에이전트의 행동 (action_dim)
+    - `rews`: 각 에이전트의 보상
+    - `vals`: 각 에이전트의 가치 추정치
+    - `dones`: 종료 여부
+- 이 데이터들은 trajectory로 저장되어, 학습 시 배치로 처리됨.
 
-### 핵심 아이디어
-- **VRNN (Variational RNN)**: 각 에이전트의 시퀀스 정보를 latent space에서 모델링
-- **Multi-Head CausalGATLayer**: 4개의 독립적인 attention head로 다양한 추론 능력 구현
-- **JSD-based Neighbor Selection**: Jensen-Shannon Divergence를 이용한 동적 neighbor 선택
-- **Adaptive Loss Balancing**: VAE, RL, Communication loss의 동적 균형 조정
+### (2) 모델 입력 및 전처리
+- `obs`는 (batch, agents, obs_dim) 형태로 모델에 입력됨.
+- `acts`는 (batch, agents) 또는 (batch, agents, action_dim) 형태로 one-hot encoding되어 사용됨.
+- `preprocess_obs` 함수에서 numpy/tensor 타입 변환 및 device 전송이 이루어짐.
 
-### 주요 특징
-- **Dec-POMDP 호환**: 각 에이전트는 자신의 관찰만 접근 가능
-- **Multi-Head Attention**: 4개의 독립적인 attention head로 다양한 추론
-- **End-to-end 학습**: VAE, RL, Communication loss를 동시에 최적화
-- **Rolling Error Attention**: 예측 오차의 이동평균을 GAT attention에 반영
-- **Layer Normalization**: 학습 안정성 향상
-- **Ablation 지원**: GAT, CausalGAT, Head별 비활성화 옵션
+---
 
-### VRNN + GAT + Actor-Critic
+## 3. 모델 아키텍처 상세
 
-1. **VRNN (Variational RNN)**: 각 에이전트의 개인 상태 인코딩
-2. **GAT (Graph Attention Network)**: 에이전트 간 상호작용 모델링
-3. **Causal GAT**: 인과적 추론을 위한 다중 헤드 어텐션
-4. **Actor-Critic**: 정책 및 가치 함수 학습
-
-### Multi-Head Causal VRNN-GAT Model 구조
-
-(아키텍처 다이어그램 및 데이터 플로우, 각 Head의 역할, Ablation 옵션 등은 기존 상세 설명을 유지)
-
-## 🛠️ 설치
-
-### 요구사항
-- Python 3.8+
-- CUDA 11.0+ (GPU 사용 시)
-- PyTorch 2.0+
-
-### 설치 방법
-
-```bash
-# 저장소 클론
-git clone <repository-url>
-cd MADP
-
-# 의존성 설치
-pip install -r requirements.txt
-
-# GPU 버전 PyTorch 설치 (선택사항)
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+### (1) SCM (Structural Causal Model)
+```python
+class SCM(nn.Module):
+    def __init__(self, obs_dim, action_dim, hidden_dim, num_agents, use_causal_prior=True):
+        # 인과구조 행렬 (학습/고정)
+        if use_causal_prior:
+            self.causal_matrix = nn.Parameter(torch.eye(num_agents), requires_grad=True)
+        else:
+            self.causal_matrix = nn.Parameter(torch.randn(num_agents, num_agents), requires_grad=True)
+        
+        # 각 agent별 인과 메커니즘
+        self.causal_mechanisms = nn.ModuleList([...])
+        
+        # 각 agent별 노이즈 모델
+        self.noise_models = nn.ModuleList([...])
 ```
 
-## ⚙️ 설정
+- 각 에이전트 간 인과관계 행렬(softmax(causal_matrix))을 학습함.
+- 각 에이전트별로 관측+행동을 받아 인과 메커니즘을 통과시킴.
+- 인과구조 행렬을 통해 각 에이전트의 효과를 가중합하여 최종 예측을 만듦.
+- 노이즈 모델을 통해 관측값에 노이즈를 추가함.
 
-`configs.yaml` 파일에서 GPU 및 훈련 설정을 조정할 수 있습니다:
+### (2) Graph Attention Layer (GAT) - Enhanced with Causal Bias
+```python
+class GraphAttentionLayer(nn.Module):
+    def __init__(self, input_dim, output_dim, num_heads=4, dropout=0.1, alpha=0.2, concat=True, use_causal_bias=True):
+        # 각 head별 선형변환
+        self.W = nn.Parameter(torch.Tensor(num_heads, input_dim, output_dim))
+        # 어텐션 메커니즘
+        self.attention = nn.Parameter(torch.Tensor(num_heads, 2 * output_dim, 1))
+        # Causal Attention Bias
+        if use_causal_bias:
+            self.causal_bias = nn.Parameter(torch.Tensor(num_heads, 1, 1))
+```
 
+- GAT 논문 기반 그래프 어텐션 레이어
+- **Causal Attention Bias**: SCM의 인과구조를 어텐션 스코어에 직접 반영
+- Multi-head attention으로 다양한 관점에서 어텐션 계산
+- LeakyReLU를 사용한 어텐션 스코어 계산
+
+### (3) CausalGAT
+```python
+class CausalGAT(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, num_heads=4, num_layers=2, 
+                 dropout=0.1, scm_causal_matrix=None, use_causal_bias=True, num_agents=2):
+        # GAT layers
+        self.gat_layers = nn.ModuleList([...])
+        
+        # SCM의 인과구조를 공유하거나 독립적인 인과구조 사용
+        if scm_causal_matrix is not None:
+            self.causal_structure = scm_causal_matrix  # SCM과 공유
+        else:
+            self.causal_structure = nn.Parameter(torch.eye(num_agents), requires_grad=True)
+```
+
+- SCM의 인과구조를 공유하여 일관된 인과관계 모델링
+- 단순화된 구조: 동적 인과구조 조정 기능 제거
+- 기본 인과구조를 GAT 레이어에 전달하여 처리
+
+### (4) MultiAgentActorCritic
+```python
+class MultiAgentActorCritic(nn.Module):
+    def __init__(self, obs_dim, action_dim, hidden_dim=64, num_agents=2, 
+                 use_gat=True, use_causal_gat=True, gat_dim=32, num_heads=4, 
+                 dropout=0.1, share_causal_structure=True):
+        # SCM (먼저 생성하여 인과구조 공유 가능)
+        self.scm = SCM(obs_dim, action_dim, hidden_dim, num_agents)
+        
+        # GAT (SCM의 인과구조를 어텐션에 반영)
+        if use_gat:
+            self.gat = GraphAttentionLayer(obs_dim, gat_dim, num_heads, dropout, concat=False, use_causal_bias=True)
+            
+        # CausalGAT (SCM의 인과구조 공유)
+        if use_causal_gat:
+            scm_causal_matrix = self.scm.causal_matrix if share_causal_structure else None
+            self.causal_gat = CausalGAT(obs_dim, gat_dim, gat_dim, num_heads, 2, dropout, 
+                                       scm_causal_matrix=scm_causal_matrix,
+                                       use_causal_bias=True, num_agents=num_agents)
+        
+        # Actor/Critic networks
+        self.actor_networks = nn.ModuleList([...])
+        self.critic_networks = nn.ModuleList([...])
+        
+        # 중앙집중 critic (MADDPG 스타일)
+        self.centralized_critic = nn.Sequential([...])
+```
+
+- 각 에이전트별로 actor/critic 네트워크를 가짐.
+- GAT과 CausalGAT의 출력을 concatenation하여 actor/critic 입력에 사용.
+- 중앙집중 critic(MADDPG 스타일)도 구현되어 있음.
+
+---
+
+## 4. Causal Reasoning의 진행 방식
+
+### (1) 인과구조 공유 메커니즘
+```python
+# SCM의 인과구조를 CausalGAT과 공유
+scm_causal_matrix = self.scm.causal_matrix if share_causal_structure else None
+self.causal_gat = CausalGAT(..., scm_causal_matrix=scm_causal_matrix)
+```
+
+### (2) GAT 어텐션에 인과구조 반영
+```python
+# SCM의 인과구조를 adj_matrix에 가중치로 적용
+if self.share_causal_structure:
+    causal_structure = self.scm.get_causal_structure()
+    causal_adj = causal_structure.unsqueeze(0).expand(batch_size, -1, -1)
+    adj_matrix = adj_matrix * causal_adj
+```
+
+### (3) Causal Attention Bias 적용
+```python
+# GraphAttentionLayer에서 인과구조를 어텐션 스코어에 직접 반영
+if self.use_causal_bias and causal_structure is not None:
+    causal_bias = causal_structure * causal_bias_expanded
+    attention_scores = attention_scores + causal_bias
+```
+
+### (4) Feature Concatenation
+```python
+# GAT과 CausalGAT의 feature를 concatenation
+if self.use_causal_gat and self.use_gat:
+    causal_features = self.causal_gat(observations, adj_matrix)
+    if communication_features is not None:
+        communication_features = torch.cat([communication_features, causal_features], dim=-1)
+```
+
+### (5) 학습 흐름
+1. **SCM 학습**: 환경 데이터로부터 agent 간 인과관계 학습
+2. **인과구조 전파**: 학습된 인과구조가 GAT의 어텐션 가중치에 반영
+3. **통신 최적화**: 인과관계가 강한 agent 간 더 많은 어텐션 부여
+4. **정책 개선**: 인과구조를 고려한 더 효과적인 통신으로 정책 학습
+
+---
+
+## 5. Loss Function 구조
+
+### (1) SCM Loss
+```python
+def compute_scm_loss(self, observations, actions, next_observations):
+    scm_predictions = self.scm(observations, actions)
+    scm_loss = F.mse_loss(scm_predictions, next_observations)
+    return scm_loss
+```
+- SCM이 예측한 다음 관측값과 실제 next observation 간의 MSE loss
+- $\text{SCM Loss} = \text{MSE}(\text{SCM}(obs, acts), next\_obs)$
+
+### (2) Causal Consistency Loss
+```python
+def compute_causal_consistency_loss(self, causal_structure):
+    sparsity_loss = torch.norm(causal_structure, p=1)
+    identity = torch.eye(causal_structure.shape[0], device=causal_structure.device)
+    identity_loss = F.mse_loss(causal_structure, identity)
+    return sparsity_loss + identity_loss
+```
+- 인과구조 행렬의 sparsity(L1)와 identity(자기 자신에 대한 영향력 유도) loss의 합
+- $\text{Causal Consistency Loss} = \|C\|_1 + \text{MSE}(C, I)$ 
+- 여기서 $C$는 softmax된 인과구조 행렬, $I$는 단위행렬
+
+### (3) Causal Attention Loss
+```python
+def compute_causal_attention_loss(self, observations, communication_features):
+    if communication_features is None:
+        return torch.tensor(0.0, device=observations.device)
+    
+    # 인과구조 기반 예상 통신 강도 계산
+    causal_structure = self.scm.get_causal_structure()
+    expected_communication = torch.bmm(
+        causal_structure.unsqueeze(0).expand(observations.shape[0], -1, -1),
+        observations
+    )
+    
+    # 통신 특성과 예상 통신 간의 일관성 loss
+    consistency_loss = F.mse_loss(
+        communication_features.mean(dim=-1, keepdim=True),
+        expected_communication.mean(dim=-1, keepdim=True)
+    )
+    return consistency_loss
+```
+- **목적**: SCM의 인과구조와 실제 통신 특성이 일치하도록 유도
+- **의미**: "인과관계가 강한 agent들 간에는 실제로도 더 많은 통신이 일어나야 한다"
+- $\text{Causal Attention Loss} = \text{MSE}(\text{comm\_features}, \text{expected\_comm})$
+
+### (4) RL Loss (Actor-Critic)
+```python
+# Policy loss
+policy_loss = -(F.log_softmax(logits, dim=-1).gather(1, act_t.unsqueeze(1)).squeeze(1) * adv_t).mean()
+
+# Value loss
+value_loss = F.mse_loss(values, gae_ret_t)
+
+# Entropy
+entropy = -(probs * F.log_softmax(logits, dim=-1)).sum(dim=-1).mean()
+
+# Total RL loss
+loss_rl = policy_loss + value_coef * value_loss - ent_coef * entropy
+```
+- 정책 손실: Advantage 기반 policy gradient
+- 가치 손실: MSE(critic, GAE target)
+- 엔트로피 보너스: 정책의 탐험성 유도
+- $\text{RL Loss} = \text{Policy Loss} + \lambda_v \cdot \text{Value Loss} - \lambda_e \cdot \text{Entropy}$
+
+### (5) Integrated Causal Loss
+```python
+def compute_integrated_causal_loss(self, observations, actions, next_observations, 
+                                 communication_features, causal_weight=1.0, attention_weight=0.5):
+    # SCM loss
+    scm_loss = self.compute_scm_loss(observations, actions, next_observations)
+    
+    # Causal consistency loss
+    causal_structure = self.scm.get_causal_structure()
+    consistency_loss = self.compute_causal_consistency_loss(causal_structure)
+    
+    # Causal attention loss
+    attention_loss = self.compute_causal_attention_loss(observations, communication_features)
+    
+    # 통합 loss
+    total_loss = causal_weight * scm_loss + consistency_loss + attention_weight * attention_loss
+    
+    return total_loss
+```
+
+### (6) Total Loss
+```python
+total_loss = integrated_causal_loss + loss_rl
+```
+- $\text{Total Loss} = \text{Integrated Causal Loss} + \text{RL Loss}$
+- $\text{Integrated Causal Loss} = \lambda_c \cdot \text{SCM Loss} + \text{Causal Consistency Loss} + \lambda_a \cdot \text{Causal Attention Loss}$
+
+---
+
+## 6. 학습 및 인과구조 시각화
+
+### (1) 학습 과정
+```python
+# 각 step마다 인과구조 저장
+self.causal_structure_list.append(causal_structure.detach().cpu().numpy())
+
+# 학습 후 시각화
+self.plot_causal_structure_evolution(output_dir)
+```
+
+### (2) 시각화 내용
+- **Evolution plot**: 각 entry(에이전트 쌍)의 softmax weight 변화
+- **Last heatmap**: 마지막 step의 인과구조 행렬
+- **Training history**: 각종 loss 변화 추이 (SCM, Causal Consistency, Causal Attention, RL losses)
+
+---
+
+## 7. 요약 도식
+
+```mermaid
+graph TD;
+    subgraph ENV["환경"]
+        O1["관측(obs)"] -->|전처리| M1["모델"]
+        A1["행동(acts)"] -->|전처리| M1
+    end
+    
+    subgraph MODEL["MultiAgentActorCritic"]
+        SCM["SCM"] -->|인과구조| GAT["GAT (Causal Bias)"]
+        SCM -->|인과구조 공유| CGAT["CausalGAT"]
+        GAT -->|통신 feature| CONCAT["Feature Concatenation"]
+        CGAT -->|인과 feature| CONCAT
+        CONCAT -->|결합된 feature| AC1["Actor/Critic"]
+    end
+    
+    AC1 -->|정책/가치| E1["환경"]
+    
+    subgraph LOSS["Loss Functions"]
+        SCM -->|SCM Loss| L1["Integrated Causal Loss"]
+        SCM -->|Causal Consistency Loss| L1
+        GAT -->|Causal Attention Loss| L1
+        L1 -->|+ RL Loss| L2["Total Loss"]
+    end
+    
+    L2 -->|Backprop| MODEL
+```
+
+---
+
+## 8. 주요 특징
+
+### (1) 인과구조 공유
+- SCM에서 학습한 인과구조가 GAT과 CausalGAT에서 공유됨
+- 일관된 인과관계 모델링으로 학습 안정성 향상
+
+### (2) Causal Attention Bias
+- SCM의 인과구조를 GAT의 어텐션 스코어에 직접 반영
+- 인과관계가 강한 agent 간 더 많은 어텐션 부여
+
+### (3) Causal Attention Loss
+- SCM의 인과구조와 실제 통신 특성 간의 일관성 유도
+- 의미있는 통신 패턴 학습
+
+### (4) Feature Concatenation
+- GAT과 CausalGAT의 feature를 독립적으로 보존하면서 결합
+- 더 풍부한 통신 정보 제공
+
+### (5) 단순화된 구조
+- 동적 인과구조 조정 기능 제거로 복잡성 감소
+- 명확하고 이해하기 쉬운 아키텍처
+
+### (6) 중앙집중 Critic
+- MADDPG 스타일의 중앙집중 가치 함수
+- 모든 agent의 관측과 행동을 고려한 가치 추정
+
+### (7) 인과구조 시각화
+- 학습 과정에서의 인과구조 변화 추적
+- 해석 가능한 인과관계 분석
+
+---
+
+## 9. Config 파라미터
+
+### (1) 모델 파라미터
 ```yaml
-# GPU 및 성능 최적화 설정
+model:
+  hidden_dim: 64
+  use_causal_prior: true
+  use_gat: true
+  use_causal_gat: true
+  gat_dim: 32
+  num_heads: 4
+  dropout: 0.1
+  share_causal_structure: true
+```
+
+### (2) 학습 파라미터
+```yaml
 params:
-  cuda: True  # GPU 사용 활성화
-  device: "cuda"  # 명시적 디바이스 지정
-  mixed_precision: True  # Mixed precision 사용
-  gradient_accumulation_steps: 1  # 그래디언트 누적 스텝
-  max_grad_norm: 1.0  # 그래디언트 클리핑
-  batch_size: 32  # 배치 크기
-  num_workers: 4  # 데이터 로딩 워커 수
-  pin_memory: True  # 메모리 핀닝
-  prefetch_factor: 2  # 프리페치 팩터
-
-# 학습 하이퍼파라미터
-training:
-  lr: 3e-4  # 학습률
-  lr_vae: 1e-3  # VAE 학습률
-  gamma: 0.99  # 할인 팩터
-  gae_lambda: 0.95  # GAE 람다
-  ent_coef: 0.01  # 엔트로피 계수
-  value_coef: 0.5  # 가치 함수 계수
-  nll_coef: 1.0  # NLL 계수
-  kl_coef: 0.1  # KL 계수
-  coop_coef: 0.1  # 협력 계수
-  ema_alpha: 0.99  # EMA 알파
-  total_steps: 1000  # 총 학습 스텝
-  ep_num: 4  # 에피소드 수
+  lr: 0.001
+  total_steps: 1000
+  ep_num: 4
+  gamma: 0.99
+  gae_lambda: 0.95
+  value_coef: 0.5
+  ent_coef: 0.01
+  causal_weight: 1.0      # SCM loss 가중치
+  attention_weight: 0.5   # Causal attention loss 가중치
+  cuda: true
 ```
 
-## 🎮 사용법
+---
 
-### 기본 실행
+## 10. 참고
+- 본 구조는 Dec-POMDP 환경에서 각 에이전트의 관측/행동/인과관계를 통합적으로 학습하여, 인과적 reasoning과 효율적 협동을 동시에 달성하는 것을 목표로 함.
+- SCM에서 학습한 인과구조가 GAT의 어텐션 메커니즘에 직접적으로 반영되어 더 효과적인 multi-agent 학습이 가능함.
+- 단순화된 구조로 인해 디버깅과 이해가 용이하며, 핵심적인 인과추론 기능은 유지됨.
 
-```bash
-# DecTiger 환경으로 훈련
-python main.py --env dectiger
-
-# MPE Simple Spread 환경으로 훈련
-python main.py --env mpe
-
-# Speaker-Listener 환경으로 훈련
-python main.py --env speaker_listener
-
-# 다른 환경들
-python main.py --env rware
-python main.py --env smax
-python main.py --env switch
-python main.py --env pp
-python main.py --env foraging
-```
-
-### 설정 저장 기능 테스트
-
-새로운 설정 저장 기능을 테스트하려면:
-
-```bash
-# 테스트 스크립트 실행
-python test_config_saving.py
-```
-
-이 스크립트는 다음을 테스트합니다:
-- 설정 저장 및 로드
-- 결과 저장 (그래프 + JSON)
-- 하이퍼파라미터가 포함된 그래프 생성
-
-### GPU 사용 확인
-
-훈련 시작 시 다음과 같은 메시지가 표시됩니다:
-
-```
-GPU 사용: NVIDIA GeForce RTX 4090
-GPU 메모리: 24.0 GB
-Mixed Precision: True
-```
-
-## 🏗️ 아키텍처 상세 (요약)
-
-- VRNNCell, Multi-Head CausalGATLayer, Policy Heads로 구성
-- 각 Head별 역할, 데이터 플로우, Loss Function, Ablation 옵션 등은 기존 설명 참고
-
-## 📊 성능 최적화
-
-### 메모리 효율성
-- 배치 처리로 GPU 활용도 극대화
-- Mixed precision으로 메모리 사용량 50% 절약
-- 자동 메모리 정리로 OOM 방지
-
-### 훈련 속도
-- GPU 병렬 처리로 CPU 대비 10-50배 속도 향상
-- Mixed precision으로 1.5-2배 속도 향상
-- 최적화된 데이터 파이프라인
 
 ## 🔧 환경별 설정
 
