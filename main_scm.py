@@ -98,8 +98,7 @@ def main():
         action_dim=act_dim,
         hidden_dim=model_cfg['hidden_dim'],
         num_agents=nagents,
-        use_gat=model_cfg.get('use_gat', True),
-        use_causal_gat=model_cfg.get('use_causal_gat', True),
+        gat_type=model_cfg.get('gat_type', 'basic'),
         gat_dim=model_cfg.get('gat_dim', 32),
         num_heads=model_cfg.get('num_heads', 4),
         dropout=model_cfg.get('dropout', 0.1)
@@ -151,8 +150,7 @@ def main():
         'n_agents': nagents,
         'hidden_dim': model_cfg['hidden_dim'],
         'gat_dim': model_cfg.get('gat_dim', 32),
-        'use_gat': model_cfg.get('use_gat', True),
-        'use_causal_gat': model_cfg.get('use_causal_gat', True)
+        'gat_type': model_cfg.get('gat_type', 'basic')
     })
     trainer = SCMTrainer(env, model, train_config, device=str(device))
     trainer.train()

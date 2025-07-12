@@ -8,6 +8,7 @@ import sys
 import json
 import os
 from datetime import datetime
+import wandb
 
 def create_progress_bar(total: int, desc: str = "Training Progress"):
     """Return a tqdm progress bar for the given total steps."""
@@ -39,6 +40,388 @@ def update_history(history: Dict[str, List[float]], metrics: Dict[str, Any]):
                 history[key].append(float(val))
             else:
                 history[key].append(float(val))
+
+# ---------------------------------------------------------------------------
+# Wandb Logging Functions
+# ---------------------------------------------------------------------------
+def init_wandb(env_name: str, model, cfg, device: str) -> bool:
+    """
+    Wandb 초기화 및 설정
+    
+    Args:
+        env_name: 환경 이름
+        model: 모델 객체
+        cfg: 설정 객체
+        device: 디바이스
+        
+    Returns:
+        wandb_enabled: wandb 초기화 성공 여부
+    """
+    try:
+        # 실험 이름 생성
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        experiment_name = f"SCM_GAT_{env_name}_{timestamp}"
+        
+        # Wandb 설정
+        wandb_config = {
+            "env_name": env_name,
+            "num_agents": model.num_agents,
+            "model": {
+                "gat_type": model.gat_type,
+                "hidden_dim": model.hidden_dim,
+                "gat_dim": model.gat_dim,
+                "action_dim": model.action_dim,
+                "obs_dim": model.obs_dim
+            },
+            "training": {
+                "lr": cfg.lr,
+                "total_steps": cfg.total_steps,
+                "gamma": cfg.gamma,
+                "gae_lambda": cfg.gae_lambda,
+                "ent_coef": cfg.ent_coef,
+                "value_coef": cfg.value_coef,
+                "max_grad_norm": getattr(cfg, 'clip_grad', 1.0)
+            },
+            "device": str(device)
+        }
+        
+        # Wandb 초기화
+        wandb.init(
+            project="SCM-GAT-MultiAgent",
+            name=experiment_name,
+            config=wandb_config,
+            tags=[env_name, "SCM", "GAT", "MultiAgent"],
+            notes=f"SCM-GAT Multi-Agent Training on {env_name}"
+        )
+        
+        # 모델 구조를 wandb에 로그
+        wandb.watch(model, log="all", log_freq=100)
+        
+        print(f"Wandb 초기화 완료: {experiment_name}")
+        return True
+        
+    except Exception as e:
+        print(f"Wandb 초기화 실패: {e}")
+        return False
+
+def log_gradients(model, wandb_enabled: bool = True) -> Optional[Dict[str, float]]:
+    """
+    Gradient 정보를 wandb에 로그
+    
+    Args:
+        model: 모델 객체
+        wandb_enabled: wandb 활성화 여부
+        
+    Returns:
+        grad_norms: gradient norm 정보 딕셔너리
+    """
+    if not wandb_enabled:
+        return None
+        
+    grad_norms = {}
+    param_norms = {}
+    
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            # Gradient norm
+            grad_norm = param.grad.norm().item()
+            grad_norms[f"grad_norm/{name}"] = grad_norm
+            
+            # Parameter norm
+            param_norm = param.norm().item()
+            param_norms[f"param_norm/{name}"] = param_norm
+            
+            # Gradient/Parameter ratio
+            if param_norm > 0:
+                grad_param_ratio = grad_norm / param_norm
+                grad_norms[f"grad_param_ratio/{name}"] = grad_param_ratio
+    
+    # 전체 gradient norm
+    total_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf'))
+    grad_norms["grad_norm/total"] = total_grad_norm
+    
+    # Wandb에 로그
+    wandb.log(grad_norms)
+    wandb.log(param_norms)
+    
+    return grad_norms
+
+def log_causal_structure(causal_structure, wandb_enabled: bool = True):
+    """
+    Causal structure를 wandb에 로그
+    
+    Args:
+        causal_structure: 인과구조 텐서
+        wandb_enabled: wandb 활성화 여부
+    """
+    if not wandb_enabled:
+        return
+        
+    # Causal structure를 이미지로 변환
+    fig, ax = plt.subplots(figsize=(6, 5))
+    im = ax.imshow(causal_structure.detach().cpu().numpy(), cmap='viridis', vmin=0, vmax=1)
+    ax.set_title('Causal Structure Matrix')
+    ax.set_xlabel('Cause')
+    ax.set_ylabel('Effect')
+    plt.colorbar(im)
+    
+    # Wandb에 이미지 로그
+    wandb.log({"causal_structure": wandb.Image(fig)})
+    plt.close(fig)
+    
+    # Causal structure 통계
+    causal_stats = {
+        "causal_structure/mean": causal_structure.mean().item(),
+        "causal_structure/std": causal_structure.std().item(),
+        "causal_structure/max": causal_structure.max().item(),
+        "causal_structure/min": causal_structure.min().item(),
+        "causal_structure/sparsity": (causal_structure < 0.1).float().mean().item()
+    }
+    wandb.log(causal_stats)
+
+def log_episode_returns(batch_returns: List[np.ndarray], wandb_enabled: bool = True):
+    """
+    Episode returns를 wandb에 로그
+    
+    Args:
+        batch_returns: 배치별 에피소드 리턴 리스트
+        wandb_enabled: wandb 활성화 여부
+    """
+    if not wandb_enabled or len(batch_returns) == 0:
+        return
+        
+    episode_return = batch_returns[-1]
+    wandb.log({
+        "episode_return/mean": np.mean(episode_return),
+        "episode_return/std": np.std(episode_return),
+        "episode_return/max": np.max(episode_return),
+        "episode_return/min": np.min(episode_return)
+    })
+
+def log_metrics(metrics: Dict[str, float], wandb_enabled: bool = True):
+    """
+    메트릭을 wandb에 로그
+    
+    Args:
+        metrics: 로그할 메트릭 딕셔너리
+        wandb_enabled: wandb 활성화 여부
+    """
+    if wandb_enabled:
+        wandb.log(metrics)
+
+def finish_wandb(wandb_enabled: bool = True):
+    """
+    Wandb 종료
+    
+    Args:
+        wandb_enabled: wandb 활성화 여부
+    """
+    if wandb_enabled:
+        wandb.finish()
+        print("Wandb 로깅 완료")
+
+# ---------------------------------------------------------------------------
+# Causal Structure Plotting Functions
+# ---------------------------------------------------------------------------
+def plot_causal_structure_evolution(causal_structure_list: List[np.ndarray], output_dir: str):
+    """
+    학습 과정에서의 causal structure 행렬 변화 시각화
+    
+    Args:
+        causal_structure_list: 학습 과정에서 저장된 인과구조 리스트
+        output_dir: 저장할 디렉토리 경로
+    """
+    if not causal_structure_list:
+        print("Causal structure list가 비어있습니다.")
+        return
+    
+    # 모든 배열의 크기가 동일한지 확인
+    first_shape = causal_structure_list[0].shape
+    for i, arr in enumerate(causal_structure_list):
+        if arr.shape != first_shape:
+            print(f"경고: {i}번째 causal structure의 크기가 다릅니다. {arr.shape} vs {first_shape}")
+            # 크기가 다른 경우 첫 번째 크기로 패딩하거나 잘라냄
+            if len(arr.shape) == 2:
+                target_shape = first_shape
+                padded_arr = np.zeros(target_shape)
+                min_rows = min(arr.shape[0], target_shape[0])
+                min_cols = min(arr.shape[1], target_shape[1])
+                padded_arr[:min_rows, :min_cols] = arr[:min_rows, :min_cols]
+                causal_structure_list[i] = padded_arr
+            else:
+                print(f"예상치 못한 차원: {arr.shape}")
+                continue
+    
+    try:
+        arr = np.stack(causal_structure_list, axis=0)  # (steps, N, N)
+        steps, N, _ = arr.shape
+        print(f"Causal structure 시각화: {steps} steps, {N}x{N} 크기")
+    except Exception as e:
+        print(f"Causal structure 배열 스택 실패: {e}")
+        print(f"배열 개수: {len(causal_structure_list)}")
+        for i, arr in enumerate(causal_structure_list):
+            print(f"  {i}: {arr.shape}")
+        return
+    
+    # (1) 마지막 causal structure heatmap
+    plt.figure(figsize=(4,4))
+    plt.title(f'Causal Structure (Last, step={steps})')
+    plt.imshow(arr[-1], cmap='viridis', vmin=0, vmax=1)
+    plt.colorbar()
+    plt.xlabel('Cause')
+    plt.ylabel('Effect')
+    plt.savefig(f"{output_dir}/causal_structure_last.png")
+    plt.show()
+    
+    # (2) 각 entry별 변화 라인플롯
+    plt.figure(figsize=(8,6))
+    for i in range(N):
+        for j in range(N):
+            plt.plot(arr[:,i,j], label=f'{i}->{j}')
+    plt.title('Causal Structure Entry Evolution')
+    plt.xlabel('Step')
+    plt.ylabel('Softmax Weight')
+    plt.legend(bbox_to_anchor=(1.05,1), loc='upper left', fontsize='small')
+    plt.tight_layout()
+    plt.savefig(f"{output_dir}/causal_structure_evolution.png")
+    plt.show()
+    
+    # (3) Sparsity 분석 추가
+    plot_sparsity_analysis(arr, output_dir)
+    
+    # (4) Entry 변화 통계
+    plot_entry_statistics(arr, output_dir)
+
+def plot_sparsity_analysis(arr: np.ndarray, output_dir: str):
+    """
+    Causal structure의 sparsity 변화 분석
+    
+    Args:
+        arr: 인과구조 배열 (steps, N, N)
+        output_dir: 저장할 디렉토리 경로
+    """
+    steps, N, _ = arr.shape
+    
+    # Sparsity 계산 (0에 가까운 entry들의 비율)
+    sparsity_ratio = []
+    mean_entries = []
+    std_entries = []
+    
+    for step in range(steps):
+        # 대각선 제외 (self-influence 제외)
+        off_diagonal = arr[step].copy()
+        np.fill_diagonal(off_diagonal, 0)
+        
+        # Sparsity ratio (0.1 이하의 값들의 비율)
+        sparsity_ratio.append(np.mean(off_diagonal < 0.1))
+        mean_entries.append(np.mean(off_diagonal))
+        std_entries.append(np.std(off_diagonal))
+    
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 8))
+    
+    # Sparsity ratio 변화
+    ax1.plot(sparsity_ratio, 'b-', linewidth=2)
+    ax1.set_title('Sparsity Ratio Evolution (Ratio of entries < 0.1)')
+    ax1.set_xlabel('Step')
+    ax1.set_ylabel('Sparsity Ratio')
+    ax1.grid(True, alpha=0.3)
+    
+    # Mean entry 변화
+    ax2.plot(mean_entries, 'r-', linewidth=2)
+    ax2.set_title('Mean Entry Value Evolution')
+    ax2.set_xlabel('Step')
+    ax2.set_ylabel('Mean Entry Value')
+    ax2.grid(True, alpha=0.3)
+    
+    # Standard deviation 변화
+    ax3.plot(std_entries, 'g-', linewidth=2)
+    ax3.set_title('Entry Standard Deviation Evolution')
+    ax3.set_xlabel('Step')
+    ax3.set_ylabel('Standard Deviation')
+    ax3.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(f"{output_dir}/sparsity_analysis.png")
+    plt.show()
+    
+    # 결과 출력
+    print(f"\n===== Sparsity Analysis =====")
+    print(f"초기 Sparsity Ratio: {sparsity_ratio[0]:.3f}")
+    print(f"최종 Sparsity Ratio: {sparsity_ratio[-1]:.3f}")
+    print(f"Sparsity 변화: {sparsity_ratio[-1] - sparsity_ratio[0]:.3f}")
+    print(f"초기 평균 Entry: {mean_entries[0]:.3f}")
+    print(f"최종 평균 Entry: {mean_entries[-1]:.3f}")
+    print(f"Entry 감소율: {(mean_entries[0] - mean_entries[-1]) / mean_entries[0] * 100:.1f}%")
+
+def plot_entry_statistics(arr: np.ndarray, output_dir: str):
+    """
+    Entry 변화의 통계적 분석
+    
+    Args:
+        arr: 인과구조 배열 (steps, N, N)
+        output_dir: 저장할 디렉토리 경로
+    """
+    steps, N, _ = arr.shape
+    
+    # 각 entry의 변화량 계산
+    initial_entries = arr[0]
+    final_entries = arr[-1]
+    change_entries = final_entries - initial_entries
+    
+    # 대각선 제거
+    np.fill_diagonal(change_entries, 0)
+    
+    # 변화량 히스토그램
+    plt.figure(figsize=(12, 4))
+    
+    plt.subplot(1, 3, 1)
+    plt.hist(change_entries.flatten(), bins=20, alpha=0.7, color='blue')
+    plt.title('Entry Change Distribution')
+    plt.xlabel('Change in Entry Value')
+    plt.ylabel('Frequency')
+    
+    # 감소한 entry들의 비율
+    decreased_ratio = np.mean(change_entries < 0)
+    increased_ratio = np.mean(change_entries > 0)
+    unchanged_ratio = np.mean(change_entries == 0)
+    
+    plt.subplot(1, 3, 2)
+    labels = ['Decreased', 'Increased', 'Unchanged']
+    sizes = [decreased_ratio, increased_ratio, unchanged_ratio]
+    colors = ['red', 'green', 'gray']
+    plt.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%')
+    plt.title('Entry Change Categories')
+    
+    # 가장 큰 변화를 보인 entry들
+    plt.subplot(1, 3, 3)
+    flat_changes = change_entries.flatten()
+    top_decreases = np.argsort(flat_changes)[:5]  # 가장 큰 감소
+    top_increases = np.argsort(flat_changes)[-5:]  # 가장 큰 증가
+    
+    plt.bar(range(5), flat_changes[top_decreases], color='red', alpha=0.7, label='Top Decreases')
+    plt.bar(range(5, 10), flat_changes[top_increases], color='green', alpha=0.7, label='Top Increases')
+    plt.title('Top 5 Entry Changes')
+    plt.xlabel('Entry Index')
+    plt.ylabel('Change Value')
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.savefig(f"{output_dir}/entry_statistics.png")
+    plt.show()
+    
+    # 통계 출력
+    print(f"\n===== Entry Change Statistics =====")
+    print(f"감소한 Entry 비율: {decreased_ratio:.1%}")
+    print(f"증가한 Entry 비율: {increased_ratio:.1%}")
+    print(f"변화없는 Entry 비율: {unchanged_ratio:.1%}")
+    print(f"평균 변화량: {np.mean(change_entries):.3f}")
+    print(f"변화량 표준편차: {np.std(change_entries):.3f}")
+    print(f"최대 감소량: {np.min(change_entries):.3f}")
+    print(f"최대 증가량: {np.max(change_entries):.3f}")
+
+# ---------------------------------------------------------------------------
+# 기존 함수들
+# ---------------------------------------------------------------------------
 
 def save_experiment_config(config: Dict[str, Any], save_dir: str, experiment_name: str = ""):
     """

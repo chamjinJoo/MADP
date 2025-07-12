@@ -7,6 +7,8 @@ from collections import deque
 import gc
 import time
 from contextlib import nullcontext
+import os
+from datetime import datetime
 
 from src.env_wrapper import MPEGymWrapper, RWAREWrapper
 from src.models_scm import MultiAgentActorCritic
@@ -17,6 +19,13 @@ from src.utils import (
     plot_history,
     plot_episode_returns,
     save_all_results,
+    init_wandb,
+    log_gradients,
+    log_causal_structure,
+    log_episode_returns,
+    log_metrics,
+    finish_wandb,
+    plot_causal_structure_evolution,
 )
 
 # ---------------------------------------------------------------------------
@@ -118,6 +127,7 @@ class SCMTrainer:
         self.cfg = cfg
         self.history = init_history([
             'scm_loss', 'causal_consistency_loss', 'do_loss', 'cf_loss',
+            'causal_gat_consistency_loss', 'causal_attention_alignment_loss', 'causal_structure_regularization_loss',
             'policy_loss', 'value_loss', 'entropy', 'loss_rl', 'total_loss', 'grad_norm'
         ])
         self.episode_returns: List[float] = []
@@ -127,11 +137,15 @@ class SCMTrainer:
         self.opt = torch.optim.Adam(self.model.parameters(), lr=cfg.lr)
         # --- causal structure 변화 저장용 리스트
         self.causal_structure_list = []
+        
+        # Wandb 초기화
+        env_name = getattr(self.env, 'name', 'unknown_env')
+        self.wandb_enabled = init_wandb(env_name, self.model, self.cfg, str(self.device))
+        
         print(f"\n Environment: {self.env.name}")
         print(f" Operation on {self.device}")
         print(f" Model Configuration:")
-        print(f"  - Use GAT: {self.model.use_gat}")
-        print(f"  - Use Causal GAT: {getattr(self.model, 'use_causal_gat', False)}")
+        print(f"  - GAT Type: {self.model.gat_type}")
         print(f"  - Hidden Dim: {self.model.hidden_dim}")
         print(f"  - GAT Dim: {self.model.gat_dim}")
         print(f"  - Number of Agents: {self.nagents}")
@@ -177,9 +191,7 @@ class SCMTrainer:
         self.batch_returns.append(batch_avg_returns)
         return traj
 
-    def log_metrics(self, metrics: Dict[str, float]):
-        update_history(self.history, metrics)
-        self.pbar.update()
+
 
     def train(self, render_freq: int = 0): # render_freq: 0: 렌더링 안함
         self.model.train()
@@ -234,6 +246,16 @@ class SCMTrainer:
             lambda_do = 1.0  # 필요시 조정
             lambda_cf = 1.0  # 필요시 조정
 
+            # 통합 Loss Functions 추가
+            causal_gat_consistency_loss = self.model.compute_causal_gat_consistency_loss(obs_torch)
+            causal_attention_alignment_loss = self.model.compute_causal_attention_alignment_loss(obs_torch)
+            causal_structure_regularization_loss = self.model.compute_causal_structure_regularization_loss()
+            
+            # Loss 가중치 설정
+            lambda_causal_gat_consistency = 0.1
+            lambda_causal_attention_alignment = 0.1
+            lambda_causal_structure_regularization = 0.05
+
             # RL loss (actor/critic)
             outputs = self.model(obs_torch)
             logits = outputs['actor_outputs'].view(-1, self.model.action_dim)
@@ -243,32 +265,53 @@ class SCMTrainer:
             probs = F.softmax(logits, dim=-1)
             entropy = -(probs * F.log_softmax(logits, dim=-1)).sum(dim=-1).mean()
             loss_rl = policy_loss + self.cfg.value_coef * value_loss - self.cfg.ent_coef * entropy
-            total_loss = scm_loss + causal_consistency_loss + loss_rl + lambda_do * do_loss + lambda_cf * cf_loss
+            total_loss = (scm_loss + causal_consistency_loss + loss_rl + 
+                         lambda_do * do_loss + lambda_cf * cf_loss +
+                         lambda_causal_gat_consistency * causal_gat_consistency_loss +
+                         lambda_causal_attention_alignment * causal_attention_alignment_loss +
+                         lambda_causal_structure_regularization * causal_structure_regularization_loss)
             total_loss.backward()
+            
+            # Gradient 모니터링 (매 10 스텝마다)
+            if global_step % 10 == 0:
+                grad_info = log_gradients(self.model, self.wandb_enabled)
+            
             grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
             self.opt.step()
             self.opt.zero_grad()
+            
+            # Causal structure 로깅 (매 50 스텝마다)
+            if global_step % 50 == 0:
+                log_causal_structure(causal_structure, self.wandb_enabled)
+            # Episode returns 로깅
+            if len(self.batch_returns) > 0:
+                log_episode_returns(self.batch_returns, self.wandb_enabled)
+            
             metrics = {
                 'scm_loss': scm_loss.item(),
                 'causal_consistency_loss': causal_consistency_loss.item(),
                 'do_loss': float(do_loss),
                 'cf_loss': float(cf_loss),
+                'causal_gat_consistency_loss': causal_gat_consistency_loss.item(),
+                'causal_attention_alignment_loss': causal_attention_alignment_loss.item(),
+                'causal_structure_regularization_loss': causal_structure_regularization_loss.item(),
                 'policy_loss': policy_loss.item(),
                 'value_loss': value_loss.item(),
                 'entropy': entropy.item(),
                 'loss_rl': loss_rl.item(),
                 'total_loss': total_loss.item(),
-                'grad_norm': grad_norm.item() if hasattr(grad_norm, 'item') else float(grad_norm)
+                'grad_norm': grad_norm.item() if hasattr(grad_norm, 'item') else float(grad_norm),
+                'global_step': global_step
             }
-            self.log_metrics(metrics)
+            log_metrics(metrics, self.wandb_enabled)
+            update_history(self.history, metrics)
+            self.pbar.update()
         self.pbar.close()
         close_env_and_figures(self.env)
-        import os
-        from datetime import datetime
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        output_dir = f"outputs_scm/{timestamp}"
-        os.makedirs(output_dir, exist_ok=True)
         env_name = getattr(self.env, 'name', 'unknown_env')
+        output_dir = f"outputs_scm/{env_name}/{timestamp}"
+        os.makedirs(output_dir, exist_ok=True)
         save_all_results(
             history=self.history,
             episode_returns=self.batch_returns,
@@ -279,23 +322,14 @@ class SCMTrainer:
             success_counts=None,
             phase_names=None
         )
-        # ---------------------- 결과 출력 및 시각화 ----------------------
-        print("\n===== 학습 결과 요약 =====")
-        if len(self.history['total_loss']) > 0:
-            print(f"최종 total_loss: {self.history['total_loss'][-1]:.4f}")
-        if len(self.history['scm_loss']) > 0:
-            print(f"최종 SCM loss: {self.history['scm_loss'][-1]:.4f}")
-        if len(self.history['causal_consistency_loss']) > 0:
-            print(f"최종 Causal Consistency loss: {self.history['causal_consistency_loss'][-1]:.4f}")
-        if len(self.history['loss_rl']) > 0:
-            print(f"최종 RL loss: {self.history['loss_rl'][-1]:.4f}")
-        if len(self.batch_returns) > 0:
-            print(f"최종 평균 리턴: {self.batch_returns[-1]}")
         # --- causal structure 변화 시각화 ---
         try:
-            self.plot_causal_structure_evolution(output_dir)
+            plot_causal_structure_evolution(self.causal_structure_list, output_dir)
         except Exception as e:
             print(f"Causal structure 시각화 오류: {e}")
+        
+        # Wandb 종료
+        finish_wandb(self.wandb_enabled)
 
     def preprocess_obs(self, obs) -> torch.Tensor:
         if isinstance(obs, torch.Tensor):
@@ -307,35 +341,7 @@ class SCMTrainer:
             return torch.as_tensor(arr, dtype=torch.float32, device=self.device)
         raise TypeError(f"Unsupported obs type: {type(obs)}")
 
-    def plot_causal_structure_evolution(self, output_dir):
-        """
-        학습 과정에서의 causal structure 행렬 변화 시각화 (heatmap 시퀀스)
-        """
-        import matplotlib.pyplot as plt
-        import numpy as np
-        arr = np.stack(self.causal_structure_list, axis=0)  # (steps, N, N)
-        steps, N, _ = arr.shape
-        # (1) 마지막 causal structure heatmap
-        plt.figure(figsize=(4,4))
-        plt.title(f'Causal Structure (Last, step={steps})')
-        plt.imshow(arr[-1], cmap='viridis', vmin=0, vmax=1)
-        plt.colorbar()
-        plt.xlabel('Cause')
-        plt.ylabel('Effect')
-        plt.savefig(f"{output_dir}/causal_structure_last.png")
-        plt.show()
-        # (2) 각 entry별 변화 라인플롯
-        plt.figure(figsize=(8,6))
-        for i in range(N):
-            for j in range(N):
-                plt.plot(arr[:,i,j], label=f'{i}->{j}')
-        plt.title('Causal Structure Entry Evolution')
-        plt.xlabel('Step')
-        plt.ylabel('Softmax Weight')
-        plt.legend(bbox_to_anchor=(1.05,1), loc='upper left', fontsize='small')
-        plt.tight_layout()
-        plt.savefig(f"{output_dir}/causal_structure_evolution.png")
-        plt.show()
+
 
 # ---------------------------------------------------------------------------
 # 메인 실행 예시 (실제 실험에서는 configs.yaml 등에서 파라미터 로드 필요)
@@ -359,8 +365,7 @@ if __name__ == "__main__":
         action_dim=action_dim,
         hidden_dim=cfg['model']['hidden_dim'],
         num_agents=num_agents,
-        use_gat=cfg['model'].get('use_gat', True),
-        use_causal_gat=cfg['model'].get('use_causal_gat', True),
+        gat_type=cfg['model'].get('gat_type', 'basic'),
         gat_dim=cfg['model'].get('gat_dim', 32),
         num_heads=cfg['model'].get('num_heads', 4),
         dropout=cfg['model'].get('dropout', 0.1)

@@ -22,12 +22,13 @@ logger:
 
 # 모델 하이퍼파라미터
 model:
-  use_gat: True
-  use_causal_gat: True
+  gat_type: "causal_enhanced"  # "none", "basic", "causal", "causal_structure", "causal_enhanced"
   use_rnn: True
   hidden_dim: 48
   z_dim: 16
   gat_dim: 16
+  num_heads: 4
+  dropout: 0.1
   act_dim: 3
 
 # 학습 하이퍼파라미터
