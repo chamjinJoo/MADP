@@ -92,7 +92,8 @@ def main():
     device = get_device(cfg)
     print(f"Using device: {device}")
     env, obs_dim, act_dim, nagents = create_env(env_name, env_cfg, SEED, device)
-    model_cfg = cfg['model']
+    # 모델 생성 (SCM 모델용 설정)
+    model_cfg = cfg['model_scm']
     model = MultiAgentActorCritic(
         obs_dim=obs_dim,
         action_dim=act_dim,
@@ -114,6 +115,7 @@ def main():
         clip_grad: float
         ent_coef: float
         value_coef: float
+        episode_length: int
         def __post_init__(self):
             pass
     train_config = TrainConfig(
@@ -124,7 +126,8 @@ def main():
         gae_lambda=float(cfg['training']['gae_lambda']),
         clip_grad=float(cfg['params']['max_grad_norm']),
         ent_coef=float(cfg['training']['ent_coef']),
-        value_coef=float(cfg['training']['value_coef'])
+        value_coef=float(cfg['training']['value_coef']),
+        episode_length=int(env_cfg.get('episode_length', 10))
     )
     experiment_config = {
         'env_name': env_name,
@@ -138,7 +141,8 @@ def main():
             'gae_lambda': train_config.gae_lambda,
             'clip_grad': train_config.clip_grad,
             'ent_coef': train_config.ent_coef,
-            'value_coef': train_config.value_coef
+            'value_coef': train_config.value_coef,
+            'episode_length': train_config.episode_length
         },
         'params': cfg['params'],
         'seed': SEED,

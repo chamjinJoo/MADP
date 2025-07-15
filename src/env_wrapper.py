@@ -77,6 +77,8 @@ class LBForagingWrapper:
             self.act_dim = self.env.action_space[0].n
         else:
             self.act_dim = self.env.action_space.n
+        # Episode length: 환경에서 max_episode_steps 가져오기
+        self.episode_length = getattr(self.env, 'max_episode_steps', 50)
 
     def reset(self, seed: int | None = None):
         if seed is not None:
@@ -109,12 +111,14 @@ class RWAREWrapper:
     """Lightweight wrapper adapting RWARE to (N, obs_dim) numpy API."""
 
     def __init__(self, env):
-        self.name = "dectiger"
+        self.name = "rware"
         self.env = env
         # Infer basic properties
         self.n: int = getattr(env, "n_agents", len(env.action_space))
         self.obs_dim: int = env.observation_space[0].shape[0]
         self.act_dim: int = env.action_space[0].n
+        # Episode length: 환경에서 max_episode_steps 가져오기
+        self.episode_length = getattr(env, 'max_episode_steps', 150)
 
     # --------------- helpers ---------------
     def _stack_obs(self, obs_tuple: Tuple[Any, ...]) -> np.ndarray:
@@ -174,6 +178,8 @@ class MPEGymWrapper:
         sample_obs = self.env.observation_space(self.agents[0])
         self.obs_dim: int = sample_obs.shape[0]
         self.act_dim: int = self.env.action_space(self.agents[0]).n
+        # Episode length: MPE는 max_cycles에 따라 결정
+        self.episode_length = max_cycles
 
     def _vec_obs(self, one_obs: Any) -> np.ndarray:
         # Observation is already a flat vector for MPE; just cast to float32
@@ -239,6 +245,8 @@ class SMAXGymWrapper:
         self._world_state_dim = getattr(self.env, "world_state_dim", 0)
         self.obs_dim: int = obs_dim_full - self._world_state_dim
         self.act_dim: int = self.env.action_space(self.agents[0]).n
+        # Episode length: SMAX는 보통 200-300 스텝 정도 (환경에서 가져올 수 없으므로 기본값 사용)
+        self.episode_length = 100
 
     # ------------- internal helpers -------------
     def _vec(self, one_obs: Dict[str, Any]) -> np.ndarray:
@@ -299,6 +307,8 @@ class DecTigerWrapper:
         self.n = self.env.nagents
         self.obs_dim = self.env.observation_space[0].shape[0]
         self.act_dim = self.env.action_space.nvec[0]  # MultiDiscrete([3,3])
+        # Episode length: DecTiger는 보통 100-150 스텝 정도 (환경에서 가져올 수 없으므로 기본값 사용)
+        self.episode_length = self.env.maxtimestep
 
     def reset(self, seed: int | None = None):
         if seed is not None:
@@ -348,6 +358,8 @@ class SwitchWrapper:
         sample_obs = self.env.reset()
         self.obs_dim = np.asarray(sample_obs, dtype=np.float32).shape[1]
         self.act_dim = 5
+        # Episode length: Switch는 max_steps에 따라 결정
+        self.episode_length = max_steps
 
     def reset(self, seed: int | None = None) -> np.ndarray:
         obs_list = self.env.reset()
@@ -504,6 +516,8 @@ class PPWrapper:
         sample_obs = self.env.reset()
         self.obs_dim = len(sample_obs[0]) if isinstance(sample_obs, list) else sample_obs.shape[1]
         self.act_dim = 5  # PredatorPrey는 5개 행동 (DOWN, LEFT, UP, RIGHT, NOOP)
+        # Episode length: PredatorPrey는 max_steps에 따라 결정
+        self.episode_length = max_steps
 
     def reset(self, seed: int | None = None) -> np.ndarray:
         """환경을 리셋하고 관찰 행렬을 반환합니다."""

@@ -13,7 +13,7 @@ class SCM(nn.Module):
     각 agent의 관측/행동 간 인과관계를 모델링.
     """
     def __init__(self, obs_dim: int, action_dim: int, hidden_dim: int = 64, 
-                 num_agents: int = 2, use_causal_prior: bool = False):
+                 num_agents: int = 2, use_causal_prior: bool = True):
         super().__init__()
         self.obs_dim = obs_dim
         self.action_dim = action_dim
@@ -57,7 +57,7 @@ class SCM(nn.Module):
         if actions.dim() == 2:
             actions = F.one_hot(actions, num_classes=self.action_dim).float()
         # 인과구조 softmax
-        causal_weights = F.sigmoid(self.causal_matrix)
+        causal_weights = F.softmax(self.causal_matrix, dim=-1)
         # obs+action 결합
         combined_input = torch.cat([observations, actions], dim=-1)
         # 인과 메커니즘 적용
@@ -80,7 +80,7 @@ class SCM(nn.Module):
 
     def get_causal_structure(self) -> torch.Tensor:
         """학습된 인과구조 행렬 반환"""
-        return F.sigmoid(self.causal_matrix)
+        return F.softmax(self.causal_matrix, dim=-1)
 
 # ---------------------------------------------------------------------------
 # 2. Graph Attention Layer (GAT)
@@ -541,18 +541,6 @@ class MultiAgentActorCritic(nn.Module):
             'scm_predictions': scm_predictions,
             'causal_structure': self.scm.get_causal_structure()
         }
-
-    def get_action_probs(self, observations: torch.Tensor, 
-                        adj_matrix: Optional[torch.Tensor] = None) -> torch.Tensor:
-        outputs = self.forward(observations, adj_matrix=adj_matrix)
-        action_logits = outputs['actor_outputs']
-        return F.softmax(action_logits, dim=-1)
-
-    def get_value(self, observations: torch.Tensor, actions: torch.Tensor,
-                  adj_matrix: Optional[torch.Tensor] = None) -> torch.Tensor:
-        outputs = self.forward(observations, actions, adj_matrix)
-        return outputs['centralized_critic_output']
-
     # -----------------------------------------------------------------------
     # Loss functions (SCM, Causal Consistency)
     # -----------------------------------------------------------------------

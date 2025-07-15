@@ -13,7 +13,7 @@ from src.env_wrapper import (DecTigerWrapper,
                              MPEGymWrapper, 
                              SwitchWrapper,
                              PPWrapper,
-                             LBForagingWrapper,)
+                             LBForagingWrapper)
 
 import yaml, argparse
 import torch
@@ -70,16 +70,7 @@ def create_env(env_name: str, env_cfg: dict, seed: int, device: torch.device | N
         act_dim = env.act_dim
         nagents = env.n
 
-    elif env_name == 'speaker_listener': # simple-speaker-listener
-        env = SpeakerListenerWrapper(
-            max_cycles=env_cfg.get("max_cycles", 25),
-            continuous_actions=env_cfg.get("continuous_actions", False),
-            seed=seed,
-            
-            )
-        obs_dim = env.obs_dim
-        act_dim = env.act_dim
-        nagents = env.n
+
 
     elif env_name == 'switch':
         env = SwitchWrapper(
@@ -116,17 +107,9 @@ def create_env(env_name: str, env_cfg: dict, seed: int, device: torch.device | N
         act_dim = env.act_dim
         nagents = env.n
         
-    elif env_name == 'blicket':
-        env = MultiAgentBlicketWrapper(n_agents=3,
-                                       n_blickets=3,
-                                       max_steps=20,
-                                       
-        )
-        obs_dim = env.obs_dim
-        act_dim = env.act_dim
-        nagents = env.n 
+
     else:
-        raise ValueError(f"Unknown environment: {env_name}. Available envs are (dectiger, rware, smax, mpe, speaker_listener, switch, pp, foraging, blicket)")
+        raise ValueError(f"Unknown environment: {env_name}. Available envs are (dectiger, rware, smax, mpe, switch, pp, foraging)")
 
     return env, obs_dim, act_dim, nagents
 
@@ -152,8 +135,8 @@ def main():
     # 환경 생성
     env, obs_dim, act_dim, nagents = create_env(env_name, env_cfg, SEED, device)
 
-    # 모델 생성
-    model_cfg = cfg['model']
+    # 모델 생성 (VRNN-GAT 모델용 설정)
+    model_cfg = cfg['model_vrnn']
     model = VRNNGATA2C(
         obs_dim=obs_dim,
         act_dim=act_dim,
@@ -162,8 +145,7 @@ def main():
         gat_dim=model_cfg['gat_dim'],
         n_agents=nagents,
         use_gat=model_cfg['use_gat'],
-        use_causal_gat=model_cfg['use_causal_gat'],
-        use_rnn=model_cfg['use_rnn']
+        use_rnn=model_cfg['use_rnn'],
     )
     # 훈련 설정
     from dataclasses import dataclass
@@ -174,6 +156,8 @@ def main():
         lr: float
         lr_vae: float
         gamma: float
+        vae_loss_type: str
+        use_kl_annealing: bool
         gae_lambda: float
         clip_grad: float
         coop_coef: float
@@ -183,7 +167,6 @@ def main():
         value_coef: float
         mixed_precision: bool
         ema_alpha: float
-        use_causal_gat: bool
         
         def __post_init__(self):
             pass
@@ -204,7 +187,8 @@ def main():
         value_coef=float(cfg['training']['value_coef']),
         mixed_precision=cfg['params'].get('mixed_precision', False),
         ema_alpha=float(cfg['training'].get('ema_alpha', 0.99)),
-        use_causal_gat=cfg.get('use_causal_gat', False)
+        vae_loss_type=cfg['training']['vae_loss_type'],
+        use_kl_annealing=cfg['training']['use_kl_annealing'],
     )
     
     # 실험 설정을 딕셔너리로 변환
@@ -227,7 +211,8 @@ def main():
             'value_coef': train_config.value_coef,
             'mixed_precision': train_config.mixed_precision,
             'ema_alpha': train_config.ema_alpha,
-            'use_causal_gat': train_config.use_causal_gat
+            'vae_loss_type': train_config.vae_loss_type,
+            'use_kl_annealing': train_config.use_kl_annealing,
         },
         'params': cfg['params'],
         'seed': SEED,
@@ -243,8 +228,9 @@ def main():
         'gat_dim': model_cfg['gat_dim'],
         'z_dim': model_cfg['z_dim'],
         'use_gat': model_cfg['use_gat'],
-        'use_causal_gat': model_cfg['use_causal_gat'],
-        'use_rnn': model_cfg['use_rnn']
+        'use_rnn': model_cfg['use_rnn'],
+        'vae_loss_type': train_config.vae_loss_type,
+        'use_kl_annealing': train_config.use_kl_annealing,
     })
     
     trainer = Trainer(env, model, train_config, device=str(device), 

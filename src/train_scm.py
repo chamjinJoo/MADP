@@ -126,8 +126,7 @@ class SCMTrainer:
         self.nagents = model.num_agents
         self.cfg = cfg
         self.history = init_history([
-            'scm_loss', 'causal_consistency_loss', 'do_loss', 'cf_loss',
-            'causal_gat_consistency_loss', 'causal_attention_alignment_loss', 'causal_structure_regularization_loss',
+            'scm_loss', 'causal_consistency_loss',
             'policy_loss', 'value_loss', 'entropy', 'loss_rl', 'total_loss', 'grad_norm'
         ])
         self.episode_returns: List[float] = []
@@ -220,6 +219,7 @@ class SCMTrainer:
             acts_np = data['acts']
             acts = torch.from_numpy(acts_np).long().to(self.device)
             acts_onehot = F.one_hot(acts, num_classes=self.model.action_dim).float()
+   
             # SCM loss, causal consistency loss, RL loss 계산
             obs_torch = self.preprocess_obs(np.stack(obs_raw, axis=0))
             next_obs_torch = self.preprocess_obs(np.stack(obs_raw[1:] + [obs_raw[-1]], axis=0))
@@ -241,21 +241,6 @@ class SCMTrainer:
                 cf_idx = int(torch.randint(0, action_dim, (1,)))
                 do_action_tensor[i, do_idx] = 1.0
                 cf_action_tensor[i, cf_idx] = 1.0
-            do_loss = self.model.compute_do_intervention_loss_all(obs_torch, actions_torch, next_obs_torch, do_action_tensor)
-            cf_loss = self.model.compute_counterfactual_loss_all(obs_torch, actions_torch, next_obs_torch, cf_action_tensor)
-            lambda_do = 1.0  # 필요시 조정
-            lambda_cf = 1.0  # 필요시 조정
-
-            # 통합 Loss Functions 추가
-            causal_gat_consistency_loss = self.model.compute_causal_gat_consistency_loss(obs_torch)
-            causal_attention_alignment_loss = self.model.compute_causal_attention_alignment_loss(obs_torch)
-            causal_structure_regularization_loss = self.model.compute_causal_structure_regularization_loss()
-            
-            # Loss 가중치 설정
-            lambda_causal_gat_consistency = 0.1
-            lambda_causal_attention_alignment = 0.1
-            lambda_causal_structure_regularization = 0.05
-
             # RL loss (actor/critic)
             outputs = self.model(obs_torch)
             logits = outputs['actor_outputs'].view(-1, self.model.action_dim)
@@ -265,11 +250,7 @@ class SCMTrainer:
             probs = F.softmax(logits, dim=-1)
             entropy = -(probs * F.log_softmax(logits, dim=-1)).sum(dim=-1).mean()
             loss_rl = policy_loss + self.cfg.value_coef * value_loss - self.cfg.ent_coef * entropy
-            total_loss = (scm_loss + causal_consistency_loss + loss_rl + 
-                         lambda_do * do_loss + lambda_cf * cf_loss +
-                         lambda_causal_gat_consistency * causal_gat_consistency_loss +
-                         lambda_causal_attention_alignment * causal_attention_alignment_loss +
-                         lambda_causal_structure_regularization * causal_structure_regularization_loss)
+            total_loss = (scm_loss + causal_consistency_loss + loss_rl)
             total_loss.backward()
             
             # Gradient 모니터링 (매 10 스텝마다)
@@ -290,11 +271,6 @@ class SCMTrainer:
             metrics = {
                 'scm_loss': scm_loss.item(),
                 'causal_consistency_loss': causal_consistency_loss.item(),
-                'do_loss': float(do_loss),
-                'cf_loss': float(cf_loss),
-                'causal_gat_consistency_loss': causal_gat_consistency_loss.item(),
-                'causal_attention_alignment_loss': causal_attention_alignment_loss.item(),
-                'causal_structure_regularization_loss': causal_structure_regularization_loss.item(),
                 'policy_loss': policy_loss.item(),
                 'value_loss': value_loss.item(),
                 'entropy': entropy.item(),

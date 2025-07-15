@@ -9,6 +9,7 @@ import json
 import os
 from datetime import datetime
 import wandb
+import matplotlib.pyplot as plt
 
 def create_progress_bar(total: int, desc: str = "Training Progress"):
     """Return a tqdm progress bar for the given total steps."""
@@ -44,6 +45,25 @@ def update_history(history: Dict[str, List[float]], metrics: Dict[str, Any]):
 # ---------------------------------------------------------------------------
 # Wandb Logging Functions
 # ---------------------------------------------------------------------------
+def ask_wandb_logging() -> bool:
+    """
+    학습 시작 전에 wandb 로깅 여부를 사용자에게 물어봅니다.
+    Returns:
+        True: wandb 로깅 사용
+        False: wandb 로깅 사용 안함
+    """
+    try:
+        answer = input("Wandb에 실험을 로깅하시겠습니까? (y/n): ").strip().lower()
+        if answer in ["y", "yes", "1"]:
+            print("Wandb 로깅을 활성화합니다.")
+            return True
+        else:
+            print("Wandb 로깅을 비활성화합니다.")
+            return False
+    except Exception as e:
+        print(f"입력 오류: {e}. 기본값(False)으로 진행합니다.")
+        return False
+
 def init_wandb(env_name: str, model, cfg, device: str) -> bool:
     """
     Wandb 초기화 및 설정

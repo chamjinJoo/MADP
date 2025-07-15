@@ -25,104 +25,88 @@ def to_gpu_optimized(tensor, device=None):
     else:
         return tensor.to(device) if device is not None else tensor
 
-def batch_forward(model, inputs, device=None):
-    """배치 전방 전파 최적화"""
-    if device is not None and device.type == 'cuda':
-        # GPU에서 배치 처리 최적화
-        with torch.cuda.amp.autocast(enabled=True):
-            return model(inputs)
-    else:
-        return model(inputs)
-
 # ---------------------------------------------------------------------------
 # 1.  VRNN building blocks
 # ---------------------------------------------------------------------------
 class VRNNCell(nn.Module):
-    """GPU 최적화된 Single‑step Variational RNN cell (Chung et al., 2015).
+    """GPU 최적화된 Variational RNN cell - 개별 agent 정보만 사용"""
 
-    Prior, encoder, decoder are simple MLPs. Replace with CNNs/TCNs for images.
-    """
     LOGVAR_CLAMP = 10.0
 
     def __init__(
         self, 
         o_dim: int,
-        a_dim: int, 
         h_dim: int, 
-        z_dim: int, 
+        z_dim: int,
+        n_agents: int = 2,
     ) -> None:
         super().__init__()
         self.o_dim = o_dim
         self.z_dim = z_dim
-
+        self.n_agents = n_agents
+        # 개별 agent hidden state dimension (multi-agent 사용 안함)
+        self.multi_h_dim = h_dim        
         # RNN core
-        self.rnn = nn.GRUCell(o_dim + a_dim + z_dim, h_dim)
-        
-        # Prior p(z_t | h_{t-1})
+        self.rnn = nn.GRUCell(o_dim + z_dim, h_dim)
+        # Prior p(z_t | h_{t-1}) - 개별 agent 정보만 사용
         self.prior_net = nn.Sequential(
-            nn.Linear(h_dim, h_dim), nn.ReLU(), 
+            nn.Linear(self.multi_h_dim, h_dim), nn.ReLU(), 
             nn.Linear(h_dim, z_dim * 2)
         )
-        # Encoder q(z_t | x_t, h_{t-1})
+        # Encoder q(z_t | x_t, h_{t-1}) - 개별 agent 정보만 사용
         self.enc_net = nn.Sequential(
-            nn.Linear(o_dim + h_dim, h_dim), nn.ReLU(), 
+            nn.Linear(o_dim + self.multi_h_dim, h_dim), nn.ReLU(), 
             nn.Linear(h_dim, z_dim * 2)
         )
         # Decoder p(x_t | z_t, h_{t-1}) — predicts μ and log σ² (diagonal)
         out_dim = o_dim * 2
         self.dec_net = nn.Sequential(
-            nn.Linear(z_dim + h_dim, h_dim), nn.ReLU(),
+            nn.Linear(z_dim + self.multi_h_dim, h_dim), nn.ReLU(),
             nn.Linear(h_dim, out_dim)
         )
-
     def _split_mu_logvar(self, t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         mu, logvar = t.chunk(2, dim=-1)
         return mu, logvar
-
     def forward(
         self,
         x_t: torch.Tensor,
-        a_prev: torch.Tensor,
         h_prev: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """One VRNN step.
-        
+        """개별 agent VRNN step.
+        Args:
+            x_t: 현재 agent의 observation (obs_dim,)
+            h_prev: 현재 agent의 이전 hidden state (hidden_dim,)
         Returns
         -------
         h_t : next hidden state
-        recon_x : decoder output
-        kl : KL divergence at this step (no beta factor)
+        nll : negative log likelihood
+        kl : KL divergence at this step
         z_t : latent sample
-        mu_q, logvar_q : encoder stats (useful for diagnostics)
+        mu_q, logvar_q : encoder stats
         """
-
         x_t = x_t.float()
-        a_prev = a_prev.float()
         h_prev = h_prev.float()
 
-        # Prior h_{t-1} -> z_t 
+        # Prior h_{t-1} -> z_t (개별 agent 정보만 사용)
         prior_stats = self.prior_net(h_prev)
         mu_p, logvar_p = self._split_mu_logvar(prior_stats)
-
-        # Encoder (posterior) x_t, h_{t-1} -> z_t
+        logvar_p = torch.clamp(logvar_p, min=-self.LOGVAR_CLAMP, max=self.LOGVAR_CLAMP) 
+        # Encoder (posterior) x_t, h_{t-1} -> z_t (개별 agent 정보만 사용)
         enc_input = torch.cat([x_t, h_prev], dim=-1)
         enc_stats = self.enc_net(enc_input)
         mu_q, logvar_q = self._split_mu_logvar(enc_stats)
         logvar_q = torch.clamp(logvar_q, min=-self.LOGVAR_CLAMP, max=self.LOGVAR_CLAMP)
-
         # Reparameterisation
         std_q = (0.5 * logvar_q).exp()
         eps = torch.randn_like(std_q)
         z_t = mu_q + eps * std_q # latent variable  
-
-        # Decoder (reconstruction) z_t, h_{t-1} -> x_t 
+        # Decoder (reconstruction) z_t, h_{t-1} -> x_t (개별 agent 정보만 사용)
         dec_out = self.dec_net(torch.cat([z_t, h_prev], dim=-1))
         mu_x, logvar_x = self._split_mu_logvar(dec_out)
         logvar_x = torch.clamp(logvar_x, min=-self.LOGVAR_CLAMP, max=self.LOGVAR_CLAMP)
-        # NLL (Gaussian, independent dims), -log⁡[𝑝_(𝜃_𝑖)(𝑜│𝑝)]
+        # NLL (Gaussian, independent dims)
         inv_var = (-logvar_x).exp()
         nll = 0.5 * ((x_t - mu_x).pow(2) * inv_var + logvar_x).sum(dim=-1)
-        
         # KL divergence analytically (Normal) D_KL(q||p)
         var_p = logvar_p.exp()
         var_q = logvar_q.exp()
@@ -132,10 +116,9 @@ class VRNNCell(nn.Module):
             + (logvar_p - logvar_q)
             - 1.0
         ).sum(dim=-1)
-        # GRU update
-        rnn_in = torch.cat([x_t, z_t, a_prev], dim=-1)
+        # GRU update (기존과 동일)
+        rnn_in = torch.cat([x_t, z_t], dim=-1)
         h_t = self.rnn(rnn_in, h_prev)
-        
         return h_t, nll, kl, z_t, mu_q, logvar_q
 
 # ---------------------------------------------------------------------------
@@ -143,10 +126,12 @@ class VRNNCell(nn.Module):
 # ---------------------------------------------------------------------------
 
 class GATLayer(nn.Module):
-    """GPU 최적화된 Two-depth single-head Graph Attention with dropout, layer norm, and optional adjacency mask."""
-    def __init__(self, in_dim: int, hid_dim: int, out_dim: int, dropout_p: float = 0.6) -> None:
+    """GPU 최적화된 Cooperation-aware Graph Attention - cooperation loss를 연결 강도에 반영"""
+    def __init__(self, in_dim: int, hid_dim: int, out_dim: int, dropout_p: float = 0.6, 
+                 use_coop_attention: bool = True) -> None:
         super().__init__()
         self.beta = 0.01
+        self.use_coop_attention = use_coop_attention
 
         # 1st attention stage
         self.W1 = nn.Linear(in_dim, hid_dim, bias=False)
@@ -160,27 +145,38 @@ class GATLayer(nn.Module):
         self.W2 = nn.Linear(hid_dim, out_dim, bias=False)
         self.a_src2 = nn.Linear(out_dim, 1, bias=False)
         self.a_dst2 = nn.Linear(out_dim, 1, bias=False)
+        
+        # Cooperation attention weights
+        if use_coop_attention:
+            self.coop_weight = nn.Parameter(torch.ones(1) * 0.1)
+            self.coop_bias = nn.Parameter(torch.zeros(1))
 
-    def forward(self, V: torch.Tensor, adj: torch.Tensor, delta: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, V: torch.Tensor, adj: torch.Tensor, 
+            coop_loss: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         V: (N, in_dim)
-        adj: (N, N) adjacency mask (1 for edge, 0 for no edge). If provided, blocks attention.
+        adj: (N, N) adjacency mask (1 for edge, 0 for no edge)
+        coop_loss: (N,) cooperation loss per agent (높을수록 더 강한 연결)
         """
         N = V.size(0)
-        # --- Normalize delta surprises ---
-        if delta is not None:
-            d_vec = delta.squeeze(-1)                  # (N,)
-            # Create pairwise bias matrix
-            d_mat = d_vec.unsqueeze(1) + d_vec.unsqueeze(0)  # (N,N)
+        
+        # --- Cooperation-based attention bias ---
+        coop_bias = None
+        if self.use_coop_attention and coop_loss is not None:
+            # Cooperation loss를 정규화하여 attention bias로 사용
+            coop_norm = torch.sigmoid(self.coop_weight * coop_loss + self.coop_bias)
+            # Pairwise cooperation bias matrix 생성
+            coop_bias = coop_norm.unsqueeze(1) + coop_norm.unsqueeze(0)  # (N,N)
+        
         # --- 1st Attention Layer ---
         Wh1 = self.W1(V)                               # (N, hid_dim)
         src1 = self.a_src1(Wh1)                        # (N,1)
         dst1 = self.a_dst1(Wh1)                        # (N,1)
         scores1 = src1 + dst1.transpose(0, 1)          # (N,N)
         
-        # Apply normalized delta bias
-        if delta is not None:
-            scores1 = scores1 + self.beta * d_mat       
+        # Apply cooperation bias
+        if coop_bias is not None:
+            scores1 = scores1 + coop_bias
         e1 = self.leaky_relu(scores1) 
         if adj is not None:
             e1 = e1.masked_fill(adj == 0, float('-inf'))
@@ -194,9 +190,9 @@ class GATLayer(nn.Module):
         dst2 = self.a_dst2(Wh2)                        # (N,1)
         scores2 = src2 + dst2.transpose(0, 1)          # (N,N)
 
-        # Reapply normalized delta bias
-        if delta is not None:
-            scores2 = scores2 + self.beta * d_mat
+        # Reapply cooperation bias
+        if coop_bias is not None:
+            scores2 = scores2 + coop_bias
 
         e2 = self.leaky_relu(scores2)
         if adj is not None:
@@ -206,163 +202,8 @@ class GATLayer(nn.Module):
         H2 = F.elu(H2)
         return H2
 
-class CausalGATLayer(nn.Module):
-    """GPU 최적화된 Multi-head Causal Graph Attention with distinct reasoning capabilities."""
-    def __init__(self, in_dim: int, hid_dim: int, out_dim: int, n_agents: int, 
-                 n_heads: int = 4, dropout_p: float = 0.6) -> None:
-        super().__init__()
-        self.n_agents = n_agents
-        self.n_heads = n_heads
-        self.head_dim = out_dim // n_heads
-        assert out_dim % n_heads == 0, "out_dim must be divisible by n_heads"
-        
-        # Multi-head attention components
-        self.W1 = nn.Linear(in_dim, hid_dim, bias=False)
-        self.W2 = None
-        
-        # Head 1: Standard attention
-        self.standard_attn = nn.ModuleList([
-            nn.Linear(hid_dim, 1, bias=False) for _ in range(2)  # src, dst
-        ])
-        
-        # Head 2: Causal attention (pairwise causal relationships)
-        self.causal_encoder = nn.Sequential(
-            nn.Linear(in_dim * 2, hid_dim), nn.ReLU(),
-            nn.Linear(hid_dim, self.head_dim)
-        )
-        self.causal_attn = nn.ModuleList([
-            nn.Linear(self.head_dim, 1, bias=False) for _ in range(2)
-        ])
-        
-        # Head 3: Temporal attention (previous hidden states)
-        self.temporal_encoder = nn.Sequential(
-            nn.Linear(in_dim + hid_dim, hid_dim), nn.ReLU(),
-            nn.Linear(hid_dim, self.head_dim)
-        )
-        self.temporal_attn = nn.ModuleList([
-            nn.Linear(self.head_dim, 1, bias=False) for _ in range(2)
-        ])
-        
-        # Head 4: Cooperative attention (cooperation patterns)
-        self.coop_encoder = nn.Sequential(
-            nn.Linear(in_dim * 3, hid_dim), nn.ReLU(),
-            nn.Linear(hid_dim, self.head_dim)
-        )
-        self.coop_attn = nn.ModuleList([
-            nn.Linear(self.head_dim, 1, bias=False) for _ in range(2)
-        ])
-        
-        # Output projection
-        self.output_proj = nn.Linear(out_dim, out_dim)
-        self.layer_norm = nn.LayerNorm(out_dim)
-        self.dropout = nn.Dropout(dropout_p)
-        
-        # Causal mask for temporal attention
-        self.register_buffer('causal_mask', torch.triu(torch.ones(n_agents, n_agents), diagonal=1).bool())
-
-    def forward(self, V: torch.Tensor, adj: torch.Tensor, delta: torch.Tensor | None = None, 
-                prev_hidden: torch.Tensor | None = None) -> torch.Tensor:
-        """
-        V: (N, in_dim)
-        adj: (N, N) adjacency mask
-        delta: (N,) or None - surprise signals
-        prev_hidden: (N, hidden_dim) or None - previous hidden states
-        """
-        N = V.size(0)
-        device = V.device
-        
-        # Head 1: Standard attention
-        Wh1 = self.W1(V)
-        src1 = self.standard_attn[0](Wh1)
-        dst1 = self.standard_attn[1](Wh1)
-        scores1 = src1 + dst1.transpose(0, 1)
-        if adj is not None:
-            scores1 = scores1.masked_fill(adj == 0, float('-inf'))
-        alpha1 = F.softmax(scores1, dim=1)
-        H1 = alpha1 @ Wh1
-        
-        # Head 2: Causal attention
-        causal_inputs = []
-        for i in range(N):
-            for j in range(N):
-                if i != j:
-                    causal_inputs.append(torch.cat([V[i], V[j]], dim=0))
-        if causal_inputs:
-            causal_inputs = torch.stack(causal_inputs, dim=0)  # (N*(N-1), in_dim*2)
-            causal_features = self.causal_encoder(causal_inputs)
-            causal_scores = self.causal_attn[0](causal_features) + self.causal_attn[1](causal_features)
-            causal_alpha = F.softmax(causal_scores, dim=0)
-            H2 = (causal_alpha * causal_features).sum(dim=0, keepdim=True).expand(N, -1)
-        else:
-            H2 = torch.zeros(N, self.head_dim, device=device)
-        
-        # Head 3: Temporal attention
-        if prev_hidden is not None:
-            temp_inputs = torch.cat([V, prev_hidden], dim=-1)
-            temp_features = self.temporal_encoder(temp_inputs)
-            temp_scores = self.temporal_attn[0](temp_features) + self.temporal_attn[1](temp_features)
-            temp_scores = temp_scores.masked_fill(self.causal_mask, float('-inf'))
-            temp_alpha = F.softmax(temp_scores, dim=1)
-            H3 = temp_alpha @ temp_features
-        else:
-            H3 = torch.zeros(N, self.head_dim, device=device)
-        
-        # Head 4: Cooperative attention
-        coop_inputs = []
-        for i in range(N):
-            neighbors = []
-            for j in range(N):
-                if adj is None or adj[i, j] == 1:
-                    neighbors.append(V[j])
-            if len(neighbors) >= 2:
-                # Take first two neighbors for cooperation pattern
-                coop_input = torch.cat([V[i], neighbors[0], neighbors[1]], dim=0)
-                coop_inputs.append(coop_input)
-            else:
-                # Pad with zeros if not enough neighbors
-                coop_input = torch.cat([V[i], torch.zeros_like(V[i]), torch.zeros_like(V[i])], dim=0)
-                coop_inputs.append(coop_input)
-        
-        coop_inputs = torch.stack(coop_inputs, dim=0)  # (N, in_dim*3)
-        coop_features = self.coop_encoder(coop_inputs)
-        coop_scores = self.coop_attn[0](coop_features) + self.coop_attn[1](coop_features)
-        coop_alpha = F.softmax(coop_scores, dim=1)
-        H4 = coop_alpha.transpose(-2, -1) @ coop_features
-        H4 = H4.squeeze(-2)  # (N, D)로 맞춤
-        
-        # 모든 텐서의 차원 확인 및 맞춤
-        if H4.dim() == 1:
-            H4 = H4.unsqueeze(-1)  # (N,) -> (N, 1)
-        elif H4.dim() == 3:
-            H4 = H4.squeeze(-2)    # (N, 1, D) -> (N, D)
-            
-        # 첫 번째 차원이 다른 텐서들과 맞는지 확인
-        expected_size = H1.size(0)  # N
-        if H4.size(0) != expected_size:
-            # H4의 첫 번째 차원을 맞춤
-            if H4.size(0) > expected_size:
-                H4 = H4[:expected_size]  # 앞에서부터 잘라냄
-            else:
-                # 부족한 경우 패딩
-                padding = torch.zeros(expected_size - H4.size(0), H4.size(1), device=H4.device)
-                H4 = torch.cat([H4, padding], dim=0)
-            
-        # Combine all heads
-        H_combined = torch.cat([H1, H2, H3, H4], dim=-1)  # (N, ?)
-        # W2를 동적으로 생성 (최초 1회만)
-        if self.W2 is None or H_combined.size(-1) != self.W2.in_features:
-            self.W2 = nn.Linear(H_combined.size(-1), self.n_heads * self.head_dim, bias=False).to(H_combined.device)
-        H_combined = self.W2(H_combined)
-        
-        # Output projection and normalization
-        output = self.output_proj(H_combined)
-        output = self.layer_norm(output)
-        output = self.dropout(output)
-        
-        return F.elu(output)
-
 class ActorCriticHead(nn.Module):
-    """GPU 최적화된 Actor-Critic 헤드"""
+    """GPU 최적화된 Actor-Critic 헤드 (Parameter Sharing)"""
     def __init__(self, in_dim: int, act_dim: int) -> None:
         super().__init__()
         self.actor = nn.Sequential(
@@ -375,12 +216,11 @@ class ActorCriticHead(nn.Module):
             nn.ReLU(),
             nn.Linear(in_dim // 2, 1)
         )
-
     def forward(self, input: torch.Tensor):
         return self.actor(input), self.critic(input)
 
 class VRNNGATA2C(nn.Module):
-    """GPU 최적화된 VRNN + GAT + Actor-Critic 모델"""
+    """개선된 VRNN + GAT + Actor-Critic 모델 - 개별 agent 정보 활용 및 Cooperation-aware GAT"""
     def __init__(
         self,
         obs_dim: int,
@@ -389,9 +229,9 @@ class VRNNGATA2C(nn.Module):
         z_dim: int,
         n_agents: int,
         gat_dim: int,
-        use_gat: bool = True,  # GAT ablation 옵션 추가
-        use_causal_gat: bool = True,  # Causal GAT 사용 옵션
-        use_rnn: bool = True,  # RNN 사용 여부 옵션 추가
+        use_gat: bool = True,
+        use_rnn: bool = True,
+        use_coop_attention: bool = True,
     ) -> None:
         super().__init__()
         self.obs_dim = obs_dim
@@ -401,49 +241,44 @@ class VRNNGATA2C(nn.Module):
         self.nagents = n_agents
         self.gat_dim = gat_dim
         self.use_gat = use_gat
-        self.use_causal_gat = use_causal_gat
         self.use_rnn = use_rnn
+        self.use_coop_attention = use_coop_attention
 
-        # VRNN cells for each agent
-        self.vrnn_cells = nn.ModuleList([
-            VRNNCell(obs_dim, act_dim, hidden_dim, z_dim)
-            for _ in range(n_agents)
-        ])
+        # 개별 agent VRNN cell - 개별 agent 정보만 사용
+        self.vrnn_cell = VRNNCell(
+            obs_dim, hidden_dim, z_dim, 
+            n_agents=n_agents
+        )
 
-        # GAT layers
+        # Cooperation-aware GAT layer
         if use_gat:
-            if use_causal_gat:
-                self.gat_layer = CausalGATLayer(
-                    hidden_dim, gat_dim, gat_dim, n_agents
-                )
-            else:
-                self.gat_layer = GATLayer(hidden_dim, gat_dim, gat_dim)
+            self.gat_layer = GATLayer(
+                hidden_dim, gat_dim, gat_dim, 
+                use_coop_attention=use_coop_attention
+            )
         else:
             self.gat_layer = None
 
-        # Actor-Critic heads
+        # Actor-Critic heads (각 agent별로 별도 네트워크)
         if use_rnn:
-            input_dim = hidden_dim + (gat_dim if use_gat else z_dim)
+            input_dim = obs_dim + (gat_dim if use_gat else z_dim)
         else:
-            input_dim = obs_dim #+ (gat_dim if use_gat else z_dim)
+            input_dim = obs_dim
         
-        self.actor_critic = ActorCriticHead(input_dim, act_dim)
-
-    def get_decoders(self) -> list[Any]:
-        """각 VRNNCell의 decoder(dec_net)를 list로 반환"""
-        return [cell.dec_net for cell in self.vrnn_cells]
+        self.actor_critic_heads = nn.ModuleList([
+            ActorCriticHead(input_dim, act_dim)
+            for _ in range(n_agents)
+        ])
 
     def forward_step(
         self,
         obs: torch.Tensor,      # (N, obs_dim)
-        a_prev: torch.Tensor,   # (N, act_dim)
         h_prev: torch.Tensor,   # (N, hidden_dim)
-        rolling_mean_error: Optional[torch.Tensor] = None,  # (N,) or None
     ) -> tuple:
         N = obs.size(0)
         device = obs.device
         
-        # VRNN forward pass for each agent
+        # 개별 agent VRNN forward pass
         h_new_list = []
         nll_list = []
         kl_list = []
@@ -452,9 +287,7 @@ class VRNNGATA2C(nn.Module):
         logvar_list = []
         
         for i in range(N):
-            h_new, nll, kl, z, mu, logvar = self.vrnn_cells[i](
-                obs[i], a_prev[i], h_prev[i]
-            )
+            h_new, nll, kl, z, mu, logvar = self.vrnn_cell(obs[i], h_prev[i])
             h_new_list.append(h_new)
             nll_list.append(nll)
             kl_list.append(kl)
@@ -469,51 +302,98 @@ class VRNNGATA2C(nn.Module):
         mu = torch.stack(mu_list, dim=0)        # (N, z_dim)
         logvar = torch.stack(logvar_list, dim=0) # (N, z_dim)
 
-        # Belief consistency loss 계산 (h_prev도 전달)
-        decoders = self.get_decoders()
-        belief_consis_loss = belief_consistency_loss(z, obs, decoders, h_prev)
+        # Cooperation loss 계산 (GAT 연결 강도에 사용)
+        coop_loss = None
+        if self.use_coop_attention and N > 1:
+            # 각 agent-pair 간의 KL divergence 계산
+            coop_loss = compute_pairwise_kl_for_gat(mu, logvar, N)
 
-        # GAT processing
+        # Cooperation-aware GAT processing
         V_gat = None
         if self.use_gat and self.gat_layer is not None:
-            # Adjacency matrix (fully connected for now)
             adj = torch.ones(N, N, device=device)
-            
-            # GAT forward pass
-            if self.use_causal_gat:
-                # Use previous GAT output for causal attention
-                prev_gat_output = getattr(self, 'prev_gat_output', None)
-                V_gat = self.gat_layer(h_new, adj, rolling_mean_error, prev_gat_output)
-                self.prev_gat_output = V_gat.detach()
-            else:
-                V_gat = self.gat_layer(h_new, adj, rolling_mean_error)
+            V_gat = self.gat_layer(h_new, adj, coop_loss=coop_loss)
 
-        # Actor-Critic forward pass
+        # Actor-Critic forward pass (각 agent별로 별도 네트워크)
         if self.use_rnn:
             if self.use_gat and V_gat is not None:
-                ac_input = torch.cat([h_new, V_gat], dim=-1)
+                ac_input = torch.cat([obs, V_gat], dim=-1)
             else:
-                ac_input = torch.cat([h_new, z], dim=-1)
+                ac_input = torch.cat([obs, z], dim=-1)
         else:
             if self.use_gat and V_gat is not None:
                 ac_input = torch.cat([obs, V_gat], dim=-1)
             else:
                 ac_input = obs
-
-        logits, values = self.actor_critic(ac_input.float())
-
-        return h_new, nll, kl, logits, None, values, mu, logvar, z, V_gat, belief_consis_loss
+        
+        # 각 agent별로 별도의 Actor-Critic 네트워크 적용
+        logits_list = []
+        values_list = []
+        for i in range(N):
+            agent_input = ac_input[i].unsqueeze(0)  # (1, input_dim)
+            agent_logits, agent_values = self.actor_critic_heads[i](agent_input.float())
+            logits_list.append(agent_logits.squeeze(0))  # (act_dim,)
+            values_list.append(agent_values.squeeze(0))   # (1,)
+        
+        logits = torch.stack(logits_list, dim=0)  # (N, act_dim)
+        values = torch.stack(values_list, dim=0)   # (N, 1)
+        
+        return h_new, nll, kl, logits, values, mu, logvar, z, V_gat
 
 # ---------------------------------------------------------------------------
-# Loss functions (GPU 최적화)
+# Loss functions (GPU 최적화) - 개선된 버전
 # ---------------------------------------------------------------------------
 
-def pairwise_coop_kl(
-    mu: torch.Tensor,        # (B, d)
-    logvar: torch.Tensor,    # (B, d)
-    n_agents: int
-) -> torch.Tensor:
-    """GPU 최적화된 pairwise cooperation KL divergence"""
+def kl_annealing_schedule(step: int, total_steps: int, min_beta: float = 0.0, max_beta: float = 1.0) -> float:
+    """KL annealing schedule - 점진적으로 KL weight를 증가시킴"""
+    if step < total_steps * 0.1:  # 처음 10%는 0
+        return min_beta
+    elif step < total_steps * 0.5:  # 10-50%는 선형 증가
+        progress = (step - total_steps * 0.1) / (total_steps * 0.4)
+        return min_beta + (max_beta - min_beta) * progress
+    else:  # 50% 이후는 최대값
+        return max_beta
+
+def compute_beta_vae_loss(
+    nll: torch.Tensor,      # (B,)
+    kl: torch.Tensor,       # (B,)
+    mu: torch.Tensor,       # (B, d)
+    logvar: torch.Tensor,   # (B, d)
+    nll_coef: float,
+    kl_coef: float,
+    coop_coef: float,
+    n_agents: int,
+    beta: float = 1.0,
+    capacity: float = 0.0,
+    target_capacity: float = 0.0
+) -> tuple[torch.Tensor, dict]:
+    """Beta-VAE loss with capacity constraint"""
+    # Basic VAE loss
+    loss_nll = nll.mean()
+    loss_kl = kl.mean()
+    
+    # Capacity constraint (KL divergence should be close to target_capacity)
+    capacity_loss = torch.abs(loss_kl - target_capacity)
+    
+    # Cooperation loss with improved stability
+    loss_coop = compute_stable_cooperation_loss(mu, logvar, n_agents)
+    
+    # Total loss with beta and capacity
+    total_loss = nll_coef * loss_nll + beta * kl_coef * loss_kl + capacity * capacity_loss + coop_coef * loss_coop
+    
+    metrics = {
+        'vae_nll': loss_nll.item(),
+        'vae_kl': loss_kl.item(),
+        'coop_kl': loss_coop.item(),
+        'capacity_loss': capacity_loss.item(),
+        'beta': beta,
+        'loss_vae': total_loss.item()
+    }
+    
+    return total_loss, metrics
+
+def compute_stable_cooperation_loss(mu: torch.Tensor, logvar: torch.Tensor, n_agents: int) -> torch.Tensor:
+    """더 안정적인 cooperation loss"""
     B, d = mu.shape
     assert B % n_agents == 0, f"Batch size {B} must be divisible by n_agents {n_agents}"
     
@@ -521,28 +401,112 @@ def pairwise_coop_kl(
     mu_reshaped = mu.view(n_agents, -1, d)      # (n_agents, batch_per_agent, d)
     logvar_reshaped = logvar.view(n_agents, -1, d)  # (n_agents, batch_per_agent, d)
     
-    total_kl = 0.0
+    # 1. Centered KL divergence (모든 agent의 평균과의 KL)
+    mu_mean = mu_reshaped.mean(dim=0, keepdim=True)  # (1, batch_per_agent, d)
+    logvar_mean = logvar_reshaped.mean(dim=0, keepdim=True)
+    
+    center_kl = 0.0
+    for i in range(n_agents):
+        kl_to_center = kl_gauss(mu_reshaped[i], logvar_reshaped[i], mu_mean.squeeze(0), logvar_mean.squeeze(0))
+        center_kl += kl_to_center.mean()
+    
+    # 2. Pairwise JSD (더 안정적)
+    pairwise_jsd = compute_pairwise_jsd_stable(mu_reshaped, logvar_reshaped)
+    
+    # 3. Variance regularization (agent 간 분산을 줄임)
+    var_reg = torch.var(mu_reshaped, dim=0).mean() + torch.var(logvar_reshaped, dim=0).mean()
+    
+    # 조합된 cooperation loss
+    total_coop_loss = 0.5 * center_kl + 0.3 * pairwise_jsd + 0.2 * var_reg
+    
+    return total_coop_loss
+
+def compute_pairwise_kl_for_gat(mu: torch.Tensor, logvar: torch.Tensor, n_agents: int) -> torch.Tensor:
+    """각 agent-pair 간의 KL divergence 계산 (GAT 연결 강도에 사용)"""
+    # 각 agent별로 다른 agent들과의 평균 KL divergence 계산
+    agent_coop_losses = []
+    for i in range(n_agents):
+        # 현재 agent의 분포
+        mu_i = mu[i:i+1]  # (1, z_dim)
+        logvar_i = logvar[i:i+1]  # (1, z_dim)
+        # 다른 agent들과의 KL divergence 계산
+        kl_to_others = []
+        for j in range(n_agents):
+            if i != j:
+                mu_j = mu[j:j+1]  # (1, z_dim)
+                logvar_j = logvar[j:j+1]  # (1, z_dim)
+                # KL(i||j) 계산
+                kl_ij = kl_gauss(mu_i, logvar_i, mu_j, logvar_j)
+                kl_to_others.append(kl_ij.mean())
+        if kl_to_others:
+            # 평균 KL을 cooperation loss로 사용 (높을수록 더 강한 연결 필요)
+            agent_coop_loss = torch.stack(kl_to_others).mean()
+        else:
+            agent_coop_loss = torch.tensor(0.0, device=mu.device, dtype=mu.dtype)
+        agent_coop_losses.append(agent_coop_loss)
+    return torch.stack(agent_coop_losses)  # (n_agents,)
+
+def compute_pairwise_jsd_stable(mu_reshaped: torch.Tensor, logvar_reshaped: torch.Tensor) -> torch.Tensor:
+    """안정적인 pairwise JSD 계산"""
+    n_agents = mu_reshaped.shape[0]
+    total_jsd = torch.tensor(0.0, device=mu_reshaped.device, dtype=mu_reshaped.dtype)
     count = 0
     
-    # Compute pairwise KL between agents
     for i in range(n_agents):
         for j in range(i + 1, n_agents):
-            mu_i = mu_reshaped[i]  # (batch_per_agent, d)
+            mu_i = mu_reshaped[i]
             logvar_i = logvar_reshaped[i]
             mu_j = mu_reshaped[j]
             logvar_j = logvar_reshaped[j]
             
-            # KL divergence between agent i and j
-            kl_ij = kl_gauss(mu_i, logvar_i, mu_j, logvar_j)
-            kl_ji = kl_gauss(mu_j, logvar_j, mu_i, logvar_i)
+            # 안정적인 JSD 계산
+            mu_m = 0.5 * (mu_i + mu_j)
+            # logvar의 안정적인 평균 계산
+            var_i = torch.exp(torch.clamp(logvar_i, min=-10, max=10))
+            var_j = torch.exp(torch.clamp(logvar_j, min=-10, max=10))
+            var_m = 0.5 * (var_i + var_j)
+            logvar_m = torch.log(torch.clamp(var_m, min=1e-8))
             
-            total_kl += kl_ij.mean() + kl_ji.mean()
-            count += 2
+            jsd = 0.5 * (kl_gauss(mu_i, logvar_i, mu_m, logvar_m) + 
+                        kl_gauss(mu_j, logvar_j, mu_m, logvar_m))
+            
+            total_jsd += jsd.mean()
+            count += 1
     
     if count > 0:
-        return torch.tensor(total_kl / count, device=mu.device, dtype=mu.dtype)
+        return (total_jsd / count).detach().clone()
     else:
-        return torch.tensor(0.0, device=mu.device, dtype=mu.dtype)
+        return torch.tensor(0.0, device=mu_reshaped.device, dtype=mu_reshaped.dtype)
+
+# 기존 함수들 (하위 호환성을 위해 유지)
+def pairwise_coop_kl(mu, logvar, n_agents):
+    B, d = mu.shape
+    b = B // n_agents
+    mu = mu.view(n_agents, b, d)           # (N, Bp, d)
+    logvar = logvar.view(n_agents, b, d)   # (N, Bp, d)
+
+    # 모든 (i,j) 조합을 브로드캐스트
+    mu_i = mu.unsqueeze(1)                # (N, 1, Bp, d)
+    mu_j = mu.unsqueeze(0)                # (1, N, Bp, d)
+    lv_i = logvar.unsqueeze(1)
+    lv_j = logvar.unsqueeze(0)
+
+    # KL(i||j)
+    var_i = lv_i.exp()
+    var_j = lv_j.exp()
+    kl_ij = 0.5 * (
+        ((mu_i - mu_j)**2 / var_j)
+        + (var_i / var_j)
+        + (lv_j - lv_i)
+        - 1.0
+    ).sum(-1)  # (N, N, Bp)
+
+    # 대각선 제외, 대칭 평균
+    mask = ~torch.eye(n_agents, dtype=torch.bool, device=mu.device)
+    kl_pair = (kl_ij + kl_ij.transpose(0,1)) / 2  # (N, N, Bp)
+    sym_kl = kl_pair[mask].mean()               # 스칼라
+
+    return sym_kl
 
 def pairwise_jsd_gaussian(mu: torch.Tensor, logvar: torch.Tensor, n_agents: int) -> torch.Tensor:
     """GPU 최적화된 pairwise Jensen-Shannon divergence"""
@@ -599,10 +563,8 @@ def compute_vae_loss(
     # Basic VAE loss
     loss_nll = nll.mean()
     loss_kl = kl.mean()
-    
     # Cooperation loss
     loss_coop = pairwise_coop_kl(mu, logvar, n_agents)
-    
     # Total loss
     total_loss = nll_coef * loss_nll + kl_coef * loss_kl + coop_coef * loss_coop
     
@@ -646,91 +608,3 @@ def compute_rl_loss(logits: torch.Tensor,
     
     return total_loss, metrics
 
-# ---------------------------------------------------------------------------
-# VAE-only cell (RNN 없이)
-# ---------------------------------------------------------------------------
-class VAECell(nn.Module):
-    """GPU 최적화된 RNN 없이 VAE만 수행하는 셀."""
-    LOGVAR_CLAMP = 10.0
-
-    def __init__(self, o_dim: int, a_dim: int, h_dim: int, z_dim: int) -> None:
-        super().__init__()
-        self.o_dim = o_dim
-        self.z_dim = z_dim
-
-        # Encoder q(z_t | x_t)
-        self.enc_net = nn.Sequential(
-            nn.Linear(o_dim + a_dim, h_dim), nn.ReLU(), 
-            nn.Linear(h_dim, z_dim * 2)
-        )
-        
-        # Decoder p(x_t | z_t)
-        out_dim = o_dim * 2
-        self.dec_net = nn.Sequential(
-            nn.Linear(z_dim, h_dim), nn.ReLU(),
-            nn.Linear(h_dim, out_dim)
-        )
-
-    def _split_mu_logvar(self, t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        mu, logvar = t.chunk(2, dim=-1)
-        return mu, logvar
-
-    def forward(
-        self,
-        x_t: torch.Tensor,
-        a_prev: torch.Tensor,
-        h_prev: torch.Tensor,  # Unused for VAE-only
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """VAE-only forward pass"""
-        # Encoder (posterior) x_t, a_prev -> z_t
-        enc_input = torch.cat([x_t, a_prev], dim=-1)
-        enc_stats = self.enc_net(enc_input)
-        mu_q, logvar_q = self._split_mu_logvar(enc_stats)
-        logvar_q = torch.clamp(logvar_q, min=-self.LOGVAR_CLAMP, max=self.LOGVAR_CLAMP)
-
-        # Reparameterisation
-        std_q = (0.5 * logvar_q).exp()
-        eps = torch.randn_like(std_q)
-        z_t = mu_q + eps * std_q
-
-        # Decoder (reconstruction) z_t -> x_t 
-        dec_out = self.dec_net(z_t)
-        mu_x, logvar_x = self._split_mu_logvar(dec_out)
-        logvar_x = torch.clamp(logvar_x, min=-self.LOGVAR_CLAMP, max=self.LOGVAR_CLAMP)
-        
-        # NLL (Gaussian, independent dims)
-        inv_var = (-logvar_x).exp()
-        nll = 0.5 * ((x_t - mu_x).pow(2) * inv_var + logvar_x).sum(dim=-1)
-        
-        # KL divergence (prior is standard normal)
-        kl = 0.5 * (mu_q.pow(2) + logvar_q.exp() - logvar_q - 1.0).sum(dim=-1)
-        
-        # Return dummy hidden state for compatibility
-        h_t = h_prev  # No RNN update
-        
-        return h_t, nll, kl, z_t, mu_q, logvar_q
-# ---------------------------------------------------------------------------
-# Belief Consistency Loss (VRNN 디코더 기반)
-# ---------------------------------------------------------------------------
-def belief_consistency_loss(zs: torch.Tensor, obs: torch.Tensor, decoders: Sequence[nn.Module], h_prevs: torch.Tensor) -> torch.Tensor:
-    """
-    zs: (N, z_dim)
-    obs: (N, obs_dim)
-    decoders: list of decoder modules (length N)
-    h_prevs: (N, h_dim) 각 에이전트의 prev hidden state
-    각 에이전트의 디코더로 (z, h_prev)를 concat하여 obs를 복원, MSE loss 계산
-    """
-    N = zs.size(0)
-    total_loss = 0.0
-    count = 0
-    for i in range(N):
-        for j in range(N):
-            dec_in = torch.cat([zs[j], h_prevs[i]], dim=-1)
-            dec_out = decoders[i](dec_in)  # (obs_dim*2)
-            mu_x, _ = dec_out.chunk(2, dim=-1)  # (obs_dim)
-            total_loss += F.mse_loss(mu_x, obs[j])
-            count += 1
-    if count > 0:
-        return torch.tensor(total_loss / count, device=zs.device, dtype=zs.dtype)
-    else:
-        return torch.tensor(0.0, device=zs.device, dtype=zs.dtype)
