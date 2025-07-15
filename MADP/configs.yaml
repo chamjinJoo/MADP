@@ -74,7 +74,7 @@ training:
   kl_coef: 1.0  # KL 계수
   coop_coef: 0.5  # 협력 계수
   ema_alpha: 0.99  # EMA 알파
-  total_steps: 3000  # 총 학습 스텝 대폭 증가
+  total_steps: 100  # 총 학습 스텝 대폭 증가
   ep_num: 5 # 에피소드 수 증가
   vae_loss_type: "standard" # "standard", "beta_vae"
   use_kl_annealing: True
