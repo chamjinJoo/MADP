@@ -17,11 +17,12 @@ from src.utils import (
     init_history,
     update_history,
     save_all_results,
+    plot_causal_structure_evolution,
     init_wandb,
     log_gradients,
     log_metrics,
     finish_wandb,
-    plot_causal_structure_evolution,
+    
     ask_wandb_logging,
 )
 from src.forward_pass_and_eval import forward_pass_and_eval
@@ -59,27 +60,27 @@ def compute_gae_multi(
     adv = np.zeros((T, N), dtype=np.float32)
     next_val = np.zeros(N, dtype=np.float32)
     next_adv = np.zeros(N, dtype=np.float32)
+    
     for t in reversed(range(T)):
         mask = 1.0 - dones[t]
         delta = rews[t] + (gamma * next_val * mask) - vals[t]
         adv[t] = delta + (gamma * lam * next_adv * mask)
         next_val, next_adv = vals[t], adv[t]
-
     return adv, adv + vals
 
-def unpack_trajectory(traj: list[tuple]) -> tuple[dict[str, list], dict[str, Any]]:
-    keys = ['obs', 'acts', 'rews', 'vals', 'dones', 'series_data']
+def unpack_trajectory(traj: list[dict]) -> tuple[dict[str, list], dict[str, Any]]:
+    keys = ['obs', 'acts', 'rews', 'next_obs', 'vals', 'dones']
     data = {k: [] for k in keys}
     for t in traj:
-        for i, k in enumerate(keys):
-            data[k].append(t[i])
+        for k in keys:
+            data[k].append(t[k])
     np_data = {
         'obs': data['obs'],
         'acts': np.stack(data['acts'], axis=0),
         'rews': np.array(data['rews'], dtype=np.float32),
+        'next_obs': data['next_obs'],
         'vals': np.stack(data['vals'], axis=0),
         'dones': np.array(data['dones'], dtype=np.float32),
-        'series_data': np.stack(data['series_data'], axis=0),  # (batch, episode_length, 2N*series_dim)
     }
     return data, np_data
 
@@ -125,26 +126,18 @@ class SCMTrainer2:
         self.model = model.to(self.device)
         self.nagents = model.num_agents
         self.cfg = cfg
+        self.ep_num = cfg.ep_num
         self.history = init_history([
-            'scm_loss', 'causal_consistency_loss',
-            'policy_loss', 'value_loss', 'entropy', 'loss_rl', 'total_loss', 'grad_norm'
+            'scm_loss', 'policy_loss', 'value_loss', 'entropy', 'total_loss', 'grad_norm'
         ])
         self.episode_returns: List[float] = []
         self.batch_returns: List[np.ndarray] = []
         self.h = None
         self.max_grad_norm = getattr(cfg, 'clip_grad', 1.0)
-        self.episode_length = getattr(self.env, 'episode_length', getattr(self.cfg, 'episode_length', 10))
-        self.opt = torch.optim.Adam(self.model.parameters(), lr=cfg.lr)
-        # --- causal structure 변화 저장용 리스트
+        self.loss_history = {'scm': [], 'policy': [], 'value': [], 'entropy': [], 'total': []}
         self.causal_structure_list = []
-        
-
-        # Wandb 초기화
+        self.opt = torch.optim.Adam(self.model.parameters(), lr=cfg.lr)
         env_name = getattr(self.env, 'name', 'unknown_env')
-        self.wandb_enabled = ask_wandb_logging()
-        if self.wandb_enabled:
-            init_wandb(env_name, self.model, self.cfg, str(self.device))
-        
         print(f"\n Environment: {self.env.name}")
         print(f" Operation on {self.device}")
         print(f" Model Configuration:")
@@ -152,217 +145,182 @@ class SCMTrainer2:
         print(f"  - Number of Agents: {self.nagents}")
         self.pbar = create_progress_bar(cfg.total_steps)
 
-    def _rollout(self, render_freq: int = 0) -> list[dict]:
-        batch_trajs: list[dict] = []
-        episodes = 0
-        step_count = 0
-        batch_episode_returns = []
-        while episodes < self.cfg.ep_num:
-            obs_series = np.zeros((self.episode_length+1, self.nagents, self.model.obs_dim))
-            reward_series = np.zeros((self.episode_length+1, self.nagents, 1))
-            obs = self.env.reset()
-            obs_series[:] = obs
-            # 시계열 저장용 리스트
-            obs_list = [obs.copy()]
-            action_list = []
-            reward_list = []; # step마다 reward만 저장 
-            done_list = []
-            done = False
-            while not done:
-                self.model.eval()
-                with torch.no_grad():
-                    obs_reward_series = np.concatenate([obs_series, reward_series], axis=-1)
-                    obs_reward_series = np.transpose(obs_reward_series, (1,0,2))
-                    obs_reward_series = obs_reward_series[None, ...]
-                    x_t = torch.as_tensor(obs_reward_series, dtype=torch.float32) # batch, timesteps, nagents, obs+reward
-                    outputs = self.model(x_t)
-                    logits = outputs['actor_outputs'].squeeze(0)  # [n_agents, action_dim]
-                    acts = sample_actions(logits)
-                acts_np = acts.cpu().numpy()
-                next_obs, reward, done, truncated, info = self.env.step(tuple(acts_np.tolist()))
-                obs_series = np.roll(obs_series, -1, axis=0)
-                reward_series = np.roll(reward_series, -1, axis=0)
-                obs_series[-1] = next_obs
-                reward_series[-1] = reward[:, None]
-                obs_list.append(next_obs.copy())
-                action_list.append(acts_np)
-                reward_list.append(np.asarray(reward, np.float32).copy())
-                done_list.append(done)
-                obs = next_obs
-                step_count += 1
-            # numpy array로 변환 및 정렬
-            obs_arr = np.stack(obs_list, axis=1)         # (n_agents, T+1, obs_dim)
-            action_arr = np.stack(action_list, axis=1)   # (n_agents, T)
-            reward_arr = np.stack(reward_list, axis=1)   # (n_agents, T)
-            done_arr = np.array(done_list, dtype=np.float32)  # (T,)
-            # zero-padding: 모든 시퀀스를 max_steps+1/max_steps 길이로 맞춤
-            max_steps = self.episode_length
-            pad_len_obs = max_steps + 1 - obs_arr.shape[1]
-            if pad_len_obs > 0:
-                obs_arr = np.pad(obs_arr, ((0,0),(0,pad_len_obs),(0,0)), mode='constant')
-            pad_len_rew = max_steps - reward_arr.shape[1]
-            if pad_len_rew > 0:
-                reward_arr = np.pad(reward_arr, ((0,0),(0,pad_len_rew)), mode='constant')
-            pad_len_act = max_steps - action_arr.shape[1]
-            if pad_len_act > 0:
-                action_arr = np.pad(action_arr, ((0,0),(0,pad_len_act)), mode='constant')
-            pad_len_done = max_steps - done_arr.shape[0]
-            if pad_len_done > 0:
-                done_arr = np.pad(done_arr, (0,pad_len_done), mode='constant')
-            batch_trajs.append({
-                'obs': obs_arr,
-                'acts': action_arr,
-                'rews': reward_arr,
-                'dones': done_arr,
+    def _rollout(self, render_freq: int = 0) -> tuple[list[dict], np.ndarray]:
+        traj: list[dict] = []
+        episode_return = np.zeros((self.nagents,), dtype=np.float32)
+        obs = self.env.reset()
+        done = False
+        t = 0
+        batch_size = 1
+        obs = np.asarray(obs, dtype=np.float32).reshape(batch_size, self.nagents, -1)
+        reward = np.zeros((batch_size, self.nagents, 1), dtype=np.float32)
+        # RNN hidden state 초기화
+        prev_hidden = torch.zeros(1, batch_size * self.nagents, self.model.n_hid, device=self.device)
+        while not done:
+            self.model.eval()
+            if render_freq > 0 and t % render_freq == 0:
+                if hasattr(self.env, 'render'):
+                    try:
+                        self.env.render(mode='human')
+                    except Exception as e:
+                        print(f"렌더링 중 오류 발생: {e}")
+            obs_torch = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
+            reward_torch = torch.as_tensor(reward, dtype=torch.float32, device=self.device).reshape(1, self.nagents, -1)
+            with torch.no_grad():
+                outputs = self.model(obs_torch, reward_torch, prev_hidden)
+                logits = outputs['actor_outputs'].squeeze(0)
+                values = outputs['critic_outputs'].squeeze(0)
+                acts = sample_actions(logits)
+                next_hidden = outputs['hidden']
+            acts_np = acts.cpu().numpy()
+            next_obs, reward, done, truncated, info = self.env.step(tuple(acts_np.tolist()))
+            next_obs = np.asarray(next_obs, dtype=np.float32)
+            traj.append({
+                'obs': obs.copy(),
+                'acts': acts_np.copy(),
+                'rews': np.asarray(reward, np.float32),
+                'vals': values.cpu().numpy(),
+                'next_obs': next_obs.copy(),
+                'dones': done,
+                'hidden': prev_hidden.detach().cpu().numpy().copy(),
             })
-            # reward_arr shape: (n_agents, max_steps)
-            # 실제 에피소드 길이까지만 reward를 합산하여 저장
-            if np.any(done_arr):
-                actual_length = np.argmax(done_arr) + 1
-            else:
-                actual_length = max_steps
-            ep_return = reward_arr[:, :actual_length].sum(axis=1)  # (n_agents,)
-            batch_episode_returns.append(ep_return)
-            episodes += 1
-        # batch_episode_returns shape: (batch, n_agents, max_steps)
-        batch_episode_returns = np.stack(batch_episode_returns, axis=0)
-        batch_avg_returns = np.mean(batch_episode_returns, axis=0)
-        self.batch_returns.append(batch_avg_returns)
-
-        return batch_trajs
+            obs = next_obs.reshape(1, self.nagents, -1)
+            reward_np = np.asarray(reward, dtype=np.float32)
+            prev_hidden = next_hidden.detach()
+            episode_return += reward_np
+            t += 1
+        return traj, episode_return
 
     def train(self, render_freq: int = 0):
         self.model.train()
         for global_step in range(self.cfg.total_steps):
             if global_step % 10 == 0:
                 optimize_memory()
-            batch_trajs = self._rollout(render_freq=render_freq)
-            total_loss_list = []  # 에피소드별 total_loss 저장
-            for ep_traj in batch_trajs:
-                acts = ep_traj['acts']
-                rews = ep_traj['rews']
-                dones = ep_traj['dones']
-                obs_arr = ep_traj['obs']  # (n_agents, T+1, obs_dim)
-                rews_arr = ep_traj['rews']  # (n_agents, T)
-                # rews_arr를 (n_agents, T+1)로 zero-padding
-                if rews_arr.shape[1] < obs_arr.shape[1]:
-                    pad_width = obs_arr.shape[1] - rews_arr.shape[1]
-                    rews_arr = np.pad(rews_arr, ((0,0), (0, pad_width)), mode='constant')
-                # obs와 reward를 마지막 차원 기준으로 concat
-                obs_reward_arr = np.concatenate([obs_arr, np.expand_dims(rews_arr, -1)], axis=-1) # [nagents, T+1, obs_dim+1]
-                obs_reward_torch = torch.as_tensor(obs_reward_arr[None, ...], dtype=torch.float32, device=self.device)  # [batch, nagents, T+1, obs_dim+1]
-                # SCM loss  
-                losses, output, edges = forward_pass_and_eval(
-                    args=self.model.scm.encoder.args,
-                    encoder=self.model.scm.encoder,
-                    decoder=self.model.scm.decoder,
-                    data=obs_reward_torch,
-                    rel_rec=self.model.scm.rel_rec,
-                    rel_send=self.model.scm.rel_send,
-                    nagents=self.nagents,
-                    hard=False,
-                )
-                scm_loss = losses['loss']
-                recon_loss = losses['loss_nll']
-                kl_loss = losses['loss_kl']
-                edge_acc = losses.get('acc', torch.tensor(0.0))
-                auroc = losses.get('auroc', torch.tensor(0.0))
-                # --- 각 timestep마다 시계열 데이터를 zero-padding하여 모델에 넣고 logits, values 시퀀스 생성 ---
-                T = self.episode_length  # max_steps
-                logits_seq = []
-                values_seq = []
-                for t in range(1, T+1):
-                    # obs_arr: (n_agents, max_steps+1, obs_dim)
-                    # reward_arr: (n_agents, max_steps)
-                    # 각 timestep마다 obs, reward를 맞춰서 concat
-                    obs_slice = obs_arr[:, :t+1, :]  # (n_agents, t+1, obs_dim)
-                    rew_slice = rews_arr[:, :t+1]   # (n_agents, t+1)
-                    # obs와 reward를 마지막 차원 기준으로 concat
-                    obs_rew_slice = np.concatenate([obs_slice, rew_slice[..., None]], axis=-1)  # (n_agents, t+1, obs_dim+1)
-                    pad_len = (T+1) - (t+1)
-                    if pad_len > 0:
-                        obs_rew_slice = np.pad(obs_rew_slice, ((0,0),(pad_len,0),(0,0)), mode='constant')
-                    input_slice = obs_rew_slice[None, ...]  # (1, n_agents, max_steps+1, obs_dim+1)
-                    outputs = self.model(torch.as_tensor(input_slice, dtype=torch.float32, device=self.device))
-                    logits = outputs['actor_outputs'].squeeze(0)
-                    values = outputs['critic_outputs'].squeeze(0)
-                    logits_seq.append(logits)
-                    values_seq.append(values.squeeze(-1))
-                logits_seq = torch.stack(logits_seq, dim=0)
-                values_seq = torch.stack(values_seq, dim=0)
-                # --- 이후 RL loss 계산에 사용 ---
-                logits_flat = logits_seq.reshape(-1, self.model.action_dim)
-                values_flat = values_seq.flatten()
-                # GAE 계산을 위해 shape 맞추기
-                rews_for_gae = rews[1:].T  # (T, n_agents)
-                vals_for_gae = values_seq.cpu().detach().numpy()  # (T, n_agents)
-                dones_for_gae = dones  # (T,)
-                if dones_for_gae.ndim == 1:
-                    if dones_for_gae.shape[0] == rews_for_gae.shape[0]:
-                        dones_for_gae = np.broadcast_to(dones_for_gae[:, None], rews_for_gae.shape)
-                    elif dones_for_gae.shape[0] == rews_for_gae.shape[1]:
-                        dones_for_gae = np.broadcast_to(dones_for_gae[None, :], rews_for_gae.shape)
+            total_loss_accum = torch.tensor(0., device=self.device)
+            batch_episode_returns = []
+            for ep in range(self.ep_num):
+                traj, episode_return = self._rollout(render_freq=render_freq)
+                _, data = unpack_trajectory(traj)
+                obs_arr = np.array(data['obs'])      # (T, n_agents, obs_dim)
+                action_arr = np.array(data['acts'])  # (T, n_agents)
+                reward_arr = np.array(data['rews'])  # (T, n_agents)
+                value_arr = np.array(data['vals'])   # (T, n_agents)
+                done_arr = np.array(data['dones'])   # (T, n_agents)
+                T = obs_arr.shape[0]
+                nagents = self.nagents
+                # --- 2. torch 변환 ---
+                obs_torch = torch.as_tensor(obs_arr, dtype=torch.float32, device=self.device)      # (T, n_agents, obs_dim)
+                reward_torch = torch.as_tensor(reward_arr, dtype=torch.float32, device=self.device)  # (T, n_agents)
+                action_torch = torch.as_tensor(action_arr, dtype=torch.long, device=self.device)      # (T, n_agents)
+                value_arr = np.array(data['vals'])
+                if value_arr.ndim == 3 and value_arr.shape[2] == 1:
+                    value_arr = value_arr.squeeze(-1)  # (T, n_agents)
+                reward_arr = np.array(data['rews'])
+                if reward_arr.ndim == 3 and reward_arr.shape[2] == 1:
+                    reward_arr = reward_arr.squeeze(-1)
+                done_arr = np.array(data['dones'])
+                if done_arr.ndim == 3 and done_arr.shape[2] == 1:
+                    done_arr = done_arr.squeeze(-1)
+                value_torch = torch.as_tensor(value_arr, dtype=torch.float32, device=self.device)     # (T, n_agents)
+                done_torch = torch.as_tensor(done_arr, dtype=torch.float32, device=self.device)       # (T, n_agents)
+                # --- 3. trajectory 전체에 대해 step-wise forward ---
+                prev_hidden = torch.zeros(1, nagents, self.model.n_hid, device=self.device)
+                scm_preds, rel_types, actor_outputs, critic_outputs = [], [], [], []
+
+                for t in range(T):
+                    obs_t = obs_torch[t]        # [1, n_agents, obs_dim]
+                    if t == 0:
+                        reward_t = torch.zeros(1, nagents, 1, device=self.device)
                     else:
-                        raise ValueError(f'dones_for_gae shape {dones_for_gae.shape} cannot be broadcast to {rews_for_gae.shape}')
-                adv_np, gae_ret_np = compute_gae_multi(
-                    rews_for_gae, vals_for_gae, dones_for_gae,
-                    self.cfg.gamma, self.cfg.gae_lambda
+                        reward_t = reward_torch[t].reshape(1, self.nagents, 1)  # [1, n_agents, 1]
+                    outputs = self.model(obs_t, reward_t, prev_hidden)
+                    scm_preds.append(outputs['scm_predictions'])
+                    rel_types.append(outputs['causal_structure'])
+                    actor_outputs.append(outputs['actor_outputs'])
+                    critic_outputs.append(outputs['critic_outputs'])
+                    prev_hidden = outputs['hidden'].detach()
+                scm_preds = torch.stack(scm_preds, dim=0)         # [T, 1, n_agents, obs_dim + 1 (reward)] 
+                rel_types = torch.stack(rel_types, dim=0)         # [T, 1, n_edges, edge_types]
+                actor_outputs = torch.stack(actor_outputs, dim=0) # [T, 1, n_agents, action_dim]
+                critic_outputs = torch.stack(critic_outputs, dim=0) # [T, 1, n_agents, 1]
+        
+                # --- 4. SCM(ACD) Loss trajectory 평균 ---
+                next_obs_arr = np.array(data['next_obs'])      # (T, n_agents, obs_dim)
+                reward_arr = np.array(data['rews'])            # (T, n_agents) or (T, n_agents, 1)
+                if reward_arr.ndim == 2:
+                    reward_arr = reward_arr[..., None]         # (T, n_agents, 1)
+                target = np.concatenate([next_obs_arr, reward_arr], axis=-1)  # (T, n_agents, obs_dim+1)
+                target_torch = torch.as_tensor(target, dtype=torch.float32, device=self.device).unsqueeze(1)  # [T, 1, n_agents, obs_dim+1]
+                acd_losses = self.model.compute_ACD_loss(rel_types, scm_preds, target_torch, nagents)
+                scm_loss = acd_losses['loss']
+
+                # --- 5. RL Loss trajectory 평균 ---
+                adv, returns = compute_gae_multi(
+                    rews=reward_arr.squeeze(-1),
+                    vals=value_arr,
+                    dones=done_arr,
+                    gamma=0.99,
+                    lam=0.95,
                 )
-                act_t = to_torch(acts, self.device, flatten=True, dtype=torch.long)
-                adv_t = to_torch(adv_np, self.device, flatten=True, dtype=torch.float)
-                gae_ret_t = to_torch(gae_ret_np, self.device, flatten=True, dtype=torch.float)
-                policy_loss = -(F.log_softmax(logits_flat, dim=-1).gather(1, act_t.unsqueeze(1)).squeeze(1) * adv_t).mean()
-                value_loss = F.mse_loss(values_flat, gae_ret_t)
-                probs = F.softmax(logits_flat, dim=-1)
-                entropy = -(probs * F.log_softmax(logits_flat, dim=-1)).sum(dim=-1).mean()
-                loss_rl = policy_loss + self.cfg.value_coef * value_loss - self.cfg.ent_coef * entropy
-                total_loss = scm_loss + loss_rl
-                total_loss_list.append(total_loss)
-                metrics = {
-                    'scm_loss': scm_loss.item(),
-                    'recon_loss': recon_loss.item(),
-                    'kl_loss': kl_loss.item(),
-                    'edge_acc': edge_acc.item() if hasattr(edge_acc, 'item') else float(edge_acc),
-                    'auroc': auroc.item() if hasattr(auroc, 'item') else float(auroc),
-                    'policy_loss': policy_loss.item(),
-                    'value_loss': value_loss.item(),
-                    'entropy': entropy.item(),
-                    'loss_rl': loss_rl.item(),
-                    'total_loss': total_loss.item(),
-                    'global_step': global_step
-                }
-                log_metrics(metrics, self.wandb_enabled)
-                update_history(self.history, metrics)
-            mean_total_loss = torch.stack(total_loss_list).mean()
+                adv_torch = torch.as_tensor(adv, dtype=torch.float32, device=self.device)
+                returns_torch = torch.as_tensor(returns, dtype=torch.float32, device=self.device)
+                acts = action_torch
+                logits = actor_outputs.squeeze(1)  # [T, n_agents, action_dim]
+                values = critic_outputs.squeeze(1).squeeze(-1)  # [T, n_agents]
+                logp = torch.log_softmax(logits, dim=-1)
+                logp_act = logp.gather(-1, acts.unsqueeze(-1)).squeeze(-1)  # [T, n_agents]
+                policy_loss = - (logp_act * adv_torch).mean()
+                value_loss = F.mse_loss(values, returns_torch)
+                entropy = (- (logp * torch.exp(logp)).sum(-1).mean())
+                # --- 6. 전체 loss 합산 및 역전파 ---
+                total_loss = scm_loss + policy_loss + value_loss - 0.01 * entropy
+                total_loss_accum = total_loss_accum + total_loss
+                batch_episode_returns.append(episode_return)
+                self.causal_structure_list.append(rel_types[-1].detach().cpu().numpy().squeeze(0))
+            total_loss_accum /= self.ep_num
             self.opt.zero_grad()
-            mean_total_loss.backward()
-            if global_step % 10 == 0:
-                grad_info = log_gradients(self.model, self.wandb_enabled)
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+            total_loss_accum.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
             self.opt.step()
+            batch_avg_returns = np.mean(batch_episode_returns, axis=0)
+            self.batch_returns.append(batch_avg_returns)
+            self.loss_history['scm'].append(float(scm_loss.item()))
+            self.loss_history['policy'].append(float(policy_loss.item()))
+            self.loss_history['value'].append(float(value_loss.item()))
+            self.loss_history['entropy'].append(float(entropy.item()))
+            self.loss_history['total'].append(float(total_loss.item()))
+            metrics = {
+                'scm_loss': float(np.mean(self.loss_history['scm'][-self.ep_num:])),
+                'policy_loss': float(np.mean(self.loss_history['policy'][-self.ep_num:])),
+                'value_loss': float(np.mean(self.loss_history['value'][-self.ep_num:])),
+                'entropy': float(np.mean(self.loss_history['entropy'][-self.ep_num:])),
+                'total_loss': float(np.mean(self.loss_history['total'][-self.ep_num:])),
+                'grad_norm': float(np.mean([p.grad.norm().item() for p in self.model.parameters() if p.grad is not None])),
+                'global_step': global_step
+            }
+            update_history(self.history, metrics)
             self.pbar.update()
         self.pbar.close()
         close_env_and_figures(self.env)
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         env_name = getattr(self.env, 'name', 'unknown_env')
-        output_dir = f"outputs_scm/{env_name}/{timestamp}"
+        output_dir = f"outputs_scm2/{env_name}/{timestamp}"
         os.makedirs(output_dir, exist_ok=True)
-
-        save_all_results(
-            history=self.history,
-            episode_returns=self.batch_returns,
-            save_dir=output_dir,
-            task_name=env_name,
-            config=None,
-            episode_counts=None,
-            success_counts=None,
-            phase_names=None
-        )
+        if self.history is not None:
+            save_all_results(
+                history=self.history,
+                episode_returns=self.batch_returns,
+                save_dir=output_dir,
+                task_name=env_name,
+                config=None,
+                episode_counts=None,
+                success_counts=None,
+                phase_names=None
+            )
         try:
             plot_causal_structure_evolution(self.causal_structure_list, output_dir)
         except Exception as e:
             print(f"Causal structure 시각화 오류: {e}")
-        finish_wandb(self.wandb_enabled)
 
     def preprocess_obs(self, obs) -> torch.Tensor:
         if isinstance(obs, torch.Tensor):

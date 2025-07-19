@@ -52,15 +52,10 @@ model_scm2:
   obs_dim: 16           # 환경에 맞게
   edge_types: 2         # ACDrepo 기본값
   var: 5e-5             # recon loss 분산
-  hidden_dim: 64
-  dropout: 0.1
-  episode_length: 10    # 환경에 맞게
-  gat_type: "causal_enhanced"
-  gat_dim: 32
+  scm_hidden_dim: 64
+  rnn_hidden_dim: 64
   num_heads: 4
   act_dim: 3
-  use_gat: True
-  scm_hidden_dim: 64
 
 # 학습 하이퍼파라미터
 training:
@@ -74,7 +69,7 @@ training:
   kl_coef: 1.0  # KL 계수
   coop_coef: 0.5  # 협력 계수
   ema_alpha: 0.99  # EMA 알파
-  total_steps: 100  # 총 학습 스텝 대폭 증가
+  total_steps: 3000  # 총 학습 스텝 대폭 증가
   ep_num: 5 # 에피소드 수 증가
   vae_loss_type: "standard" # "standard", "beta_vae"
   use_kl_annealing: True

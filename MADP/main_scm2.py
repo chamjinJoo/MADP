@@ -93,7 +93,7 @@ def main():
     print(f"Using device: {device}")
     env, obs_dim, act_dim, nagents = create_env(env_name, env_cfg, SEED, device)
     # 모델 생성 (SCM 모델용 설정)
-    model_cfg = cfg['model_scm']
+    model_cfg = cfg['model_scm2']
     episode_length = int(env_cfg.get('maxstep', 10))
 
     model = MultiAgentActorCritic(
@@ -101,9 +101,9 @@ def main():
         obs_dim=obs_dim,
         action_dim=act_dim,
         num_agents=nagents,
-        hidden_dim=model_cfg['hidden_dim'],
+        scm_hidden_dim=model_cfg['scm_hidden_dim'],
+        rnn_hidden_dim=model_cfg['rnn_hidden_dim'],
         edge_types=2,
-        episode_length=episode_length,
         gat_type=model_cfg.get('gat_type', 'basic'),
         gat_dim=model_cfg.get('gat_dim', 32),
         num_heads=model_cfg.get('num_heads', 4),
@@ -158,9 +158,6 @@ def main():
         'obs_dim': obs_dim,
         'act_dim': act_dim,
         'n_agents': nagents,
-        'hidden_dim': model_cfg['hidden_dim'],
-        'gat_dim': model_cfg.get('gat_dim', 32),
-        'gat_type': model_cfg.get('gat_type', 'basic')
     })
     trainer = SCMTrainer2(env, model, train_config, device=str(device))
     trainer.train()
