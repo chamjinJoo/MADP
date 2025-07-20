@@ -166,29 +166,30 @@ def log_gradients(model, wandb_enabled: bool = True) -> Optional[Dict[str, float
     
     return grad_norms
 
-def log_causal_structure(causal_structure, wandb_enabled: bool = True):
+def log_causal_structure(causal_structure, wandb_enabled: bool = True, vmin=None, vmax=None):
     """
     Causal structure를 wandb에 로그
-    
     Args:
         causal_structure: 인과구조 텐서
         wandb_enabled: wandb 활성화 여부
+        vmin, vmax: heatmap의 컬러 범위 (None이면 자동으로 분위수 기반)
     """
     if not wandb_enabled:
         return
-        
-    # Causal structure를 이미지로 변환
+    arr = causal_structure.detach().cpu().numpy()
+    # 자동 범위 설정: 5%~95% 분위수
+    if vmin is None:
+        vmin = np.percentile(arr, 5)
+    if vmax is None:
+        vmax = np.percentile(arr, 95)
     fig, ax = plt.subplots(figsize=(6, 5))
-    im = ax.imshow(causal_structure.detach().cpu().numpy(), cmap='viridis', vmin=0, vmax=1)
+    im = ax.imshow(arr, cmap='viridis', vmin=vmin, vmax=vmax)
     ax.set_title('Causal Structure Matrix')
     ax.set_xlabel('Cause')
     ax.set_ylabel('Effect')
     plt.colorbar(im)
-    
-    # Wandb에 이미지 로그
     wandb.log({"causal_structure": wandb.Image(fig)})
     plt.close(fig)
-    
     # Causal structure 통계
     causal_stats = {
         "causal_structure/mean": causal_structure.mean().item(),
@@ -243,74 +244,29 @@ def finish_wandb(wandb_enabled: bool = True):
 # ---------------------------------------------------------------------------
 # Causal Structure Plotting Functions
 # ---------------------------------------------------------------------------
-def plot_causal_structure_evolution(causal_structure_list: List[np.ndarray], output_dir: str):
-    """
-    학습 과정에서의 causal structure 행렬 변화 시각화
-    
-    Args:
-        causal_structure_list: 학습 과정에서 저장된 인과구조 리스트
-        output_dir: 저장할 디렉토리 경로
-    """
-    if not causal_structure_list:
-        print("Causal structure list가 비어있습니다.")
-        return
-    
-    # 모든 배열의 크기가 동일한지 확인
-    first_shape = causal_structure_list[0].shape
-    for i, arr in enumerate(causal_structure_list):
-        if arr.shape != first_shape:
-            print(f"경고: {i}번째 causal structure의 크기가 다릅니다. {arr.shape} vs {first_shape}")
-            # 크기가 다른 경우 첫 번째 크기로 패딩하거나 잘라냄
-            if len(arr.shape) == 2:
-                target_shape = first_shape
-                padded_arr = np.zeros(target_shape)
-                min_rows = min(arr.shape[0], target_shape[0])
-                min_cols = min(arr.shape[1], target_shape[1])
-                padded_arr[:min_rows, :min_cols] = arr[:min_rows, :min_cols]
-                causal_structure_list[i] = padded_arr
-            else:
-                print(f"예상치 못한 차원: {arr.shape}")
-                continue
-    
-    try:
-        arr = np.stack(causal_structure_list, axis=0)  # (steps, N, N)
-        steps, N, _ = arr.shape
-        print(f"Causal structure 시각화: {steps} steps, {N}x{N} 크기")
-    except Exception as e:
-        print(f"Causal structure 배열 스택 실패: {e}")
-        print(f"배열 개수: {len(causal_structure_list)}")
-        for i, arr in enumerate(causal_structure_list):
-            print(f"  {i}: {arr.shape}")
-        return
-    
-    # (1) 마지막 causal structure heatmap
-    plt.figure(figsize=(4,4))
-    plt.title(f'Causal Structure (Last, step={steps})')
-    plt.imshow(arr[-1], cmap='viridis', vmin=0, vmax=1)
-    plt.colorbar()
-    plt.xlabel('Cause')
-    plt.ylabel('Effect')
-    plt.savefig(f"{output_dir}/causal_structure_last.png")
-    plt.show()
-    
-    # (2) 각 entry별 변화 라인플롯
-    plt.figure(figsize=(8,6))
-    for i in range(N):
-        for j in range(N):
-            plt.plot(arr[:,i,j], label=f'{i}->{j}')
-    plt.title('Causal Structure Entry Evolution')
-    plt.xlabel('Step')
-    plt.ylabel('Softmax Weight')
-    plt.legend(bbox_to_anchor=(1.05,1), loc='upper left', fontsize='small')
+def plot_causal_structure_evolution(causal_structure_list, output_dir, steps=None):
+    import numpy as np
+    import matplotlib.pyplot as plt
+    arr = np.array(causal_structure_list)  # (steps, ...)
+    n_phases = 4
+    total_steps = arr.shape[0]
+    phase_len = total_steps // n_phases
+    fig, axes = plt.subplots(1, n_phases, figsize=(4*n_phases, 4))
+    for i in range(n_phases):
+        start = i * phase_len
+        end = (i+1) * phase_len if i < n_phases-1 else total_steps
+        phase_avg = arr[start:end].mean(axis=0)
+        ax = axes[i]
+        vmin = np.percentile(phase_avg, 5)
+        vmax = np.percentile(phase_avg, 95)
+        im = ax.imshow(phase_avg, cmap='viridis', vmin=vmin, vmax=vmax)
+        ax.set_title(f'Phase {i+1}\nsteps {start}~{end}')
+        ax.set_xlabel('Cause')
+        ax.set_ylabel('Effect')
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     plt.tight_layout()
-    plt.savefig(f"{output_dir}/causal_structure_evolution.png")
-    plt.show()
-    
-    # (3) Sparsity 분석 추가
-    plot_sparsity_analysis(arr, output_dir)
-    
-    # (4) Entry 변화 통계
-    plot_entry_statistics(arr, output_dir)
+    plt.savefig(f"{output_dir}/causal_structure_phases.png")
+    plt.close()
 
 def plot_sparsity_analysis(arr: np.ndarray, output_dir: str):
     """
@@ -395,6 +351,8 @@ def plot_entry_statistics(arr: np.ndarray, output_dir: str):
     plt.figure(figsize=(12, 4))
     
     plt.subplot(1, 3, 1)
+    vmin = np.percentile(change_entries, 5)
+    vmax = np.percentile(change_entries, 95)
     plt.hist(change_entries.flatten(), bins=20, alpha=0.7, color='blue')
     plt.title('Entry Change Distribution')
     plt.xlabel('Change in Entry Value')
@@ -712,7 +670,14 @@ def save_all_results(history: Dict[str, List[float]],
     
     # 에피소드 리턴 데이터도 저장
     returns_path = os.path.join(save_dir, "episode_returns.json")
-    returns_data = [r.tolist() if isinstance(r, np.ndarray) else r for r in episode_returns]
+    def to_serializable(r):
+        if isinstance(r, np.ndarray):
+            return r.tolist()
+        elif isinstance(r, np.generic):
+            return float(r)
+        else:
+            return r
+    returns_data = [to_serializable(r) for r in episode_returns]
     with open(returns_path, 'w', encoding='utf-8') as f:
         json.dump(returns_data, f, indent=2, ensure_ascii=False)
     

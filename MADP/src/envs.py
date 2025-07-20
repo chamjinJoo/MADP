@@ -70,34 +70,29 @@ class DecTigerEnv(gym.Env):
         done = False
         a0, a1 = int(action[0]), int(action[1])
         ja = (self._actions[a0], self._actions[a1])
-        
-        # 시간 압박을 고려한 보상 계산
-        time_pressure = self.time * self._time_pressure_factor
-        opportunity_cost = self.time * self._opportunity_cost_factor
+
         
         # Compute reward with time pressure
         if ja == ("listen", "listen"):
             # 시간이 지날수록 listen 페널티 증가
-            base_penalty = self._base_listen_penalty
-            time_penalty = time_pressure
-            reward = base_penalty - time_penalty
+            reward = -0.2
         else:
             done = True
             if ja == ("open-left", "open-left"):
                 base_reward = -10 if self.state=="tiger-left" else +2.0
-                reward = base_reward - opportunity_cost
+                reward = base_reward 
             elif ja == ("open-right", "open-right"):
                 base_reward = -10 if self.state=="tiger-right" else +2.0
-                reward = base_reward - opportunity_cost
+                reward = base_reward 
             elif ja in [("open-left","open-right"), ("open-right","open-left")]:
-                reward = -10.1 - opportunity_cost
+                reward = -10.1 
             else:
                 opener = ja[1] if ja[0]=="listen" else ja[0]
                 if opener == "open-left":
                     base_reward = -10 if self.state=="tiger-left" else +0.3
                 else:
                     base_reward = -10 if self.state=="tiger-right" else +0.3
-                reward = base_reward - opportunity_cost
+                reward = base_reward 
         
         # Generate base discrete obs per agent
         if ja == ("listen", "listen"):
@@ -118,10 +113,7 @@ class DecTigerEnv(gym.Env):
             'obs0': 'hear-right' if o0 else 'hear-left', 
             'obs1': 'hear-right' if o1 else 'hear-left',
             'time': self.time,
-            'time_pressure': time_pressure,
-            'opportunity_cost': opportunity_cost,
         }
-        
         self.time += 1
         if self.time == self.maxtimestep:
             done = True

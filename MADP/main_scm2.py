@@ -2,10 +2,8 @@ import os
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
 from src.train_scm2 import SCMTrainer2, get_device
-from src.models_scm2 import MultiAgentActorCritic
-from src.utils import save_all_results
+from src.models_scm2 import ACD_VAE_A2C
 from pathlib import Path
-from src.envs import DecTigerEnv
 from src.env_wrapper import (
     DecTigerWrapper, RWAREWrapper, SMAXGymWrapper, MPEGymWrapper, SwitchWrapper, PPWrapper, LBForagingWrapper
 )
@@ -96,7 +94,7 @@ def main():
     model_cfg = cfg['model_scm2']
     episode_length = int(env_cfg.get('maxstep', 10))
 
-    model = MultiAgentActorCritic(
+    model = ACD_VAE_A2C(
         args=cfg,
         obs_dim=obs_dim,
         action_dim=act_dim,
@@ -104,8 +102,6 @@ def main():
         scm_hidden_dim=model_cfg['scm_hidden_dim'],
         rnn_hidden_dim=model_cfg['rnn_hidden_dim'],
         edge_types=2,
-        gat_type=model_cfg.get('gat_type', 'basic'),
-        gat_dim=model_cfg.get('gat_dim', 32),
         num_heads=model_cfg.get('num_heads', 4),
         dropout=model_cfg.get('dropout', 0.1)
     )
